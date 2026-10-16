@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT -->
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CentralHub</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="titlebar" style="--wails-draggable:drag">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" fill="none">
+        <defs>
+          <linearGradient id="bmBg" x1="0" y1="0" x2="24" y2="24">
+            <stop stop-color="#1b2030"/><stop offset="1" stop-color="#0f1219"/>
+          </linearGradient>
+          <linearGradient id="bmGlyph" x1="3" y1="3" x2="21" y2="21">
+            <stop stop-color="#1ACDFF"/><stop offset="1" stop-color="#4037FF"/>
+          </linearGradient>
+        </defs>
+        <rect width="24" height="24" rx="6.5" fill="url(#bmBg)"/>
+        <g fill="url(#bmGlyph)">
+          <rect x="5" y="4.8" width="14" height="3.8" rx="1.2"/>
+          <rect x="5" y="10.1" width="14" height="3.8" rx="1.2"/>
+          <rect x="5" y="15.4" width="14" height="3.8" rx="1.2"/>
+        </g>
+        <g fill="#131620">
+          <circle cx="7.3" cy="6.7" r="0.7"/><circle cx="7.3" cy="12" r="0.7"/><circle cx="7.3" cy="17.3" r="0.7"/>
+        </g>
+      </svg>
+      <span class="brand-name">CentralHub</span>
+      <span class="brand-version" id="versione"></span>
+    </div>
+    <div class="titlebar-actions" style="--wails-draggable:no-drag">
+      <button class="btn ghost" id="btn-importa" title="Aggiunge alla lista i repository di un file JSON (con le loro chiavi, se il file le contiene)">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        Importa
+      </button>
+      <button class="btn ghost" id="btn-esporta" title="Esporta repository, tag e impostazioni in un file JSON, con o senza le chiavi di accesso">
+        <svg viewBox="0 0 24 24"><path d="M12 13V3m0 0L8 7m4-4l4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        Esporta
+      </button>
+      <button class="btn ghost" id="btn-log" title="Mostra o nascondi il registro">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h10M4 19h16"/></svg>
+        Registro
+      </button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <main class="content">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <div class="segmenti" id="modo">
+            <button data-modo="update" title="Installa e aggiorna i programmi su questo computer">
+              <svg viewBox="0 0 24 24"><path d="M20 5v5h-5M4 19v-5h5M5.5 9a7 7 0 0111.6-2.6L20 10M4 14l2.9 3.6A7 7 0 0018.5 15"/></svg>
+              Update
+            </button>
+            <button data-modo="archivio" title="Scarica tutti i pacchetti di ogni release in una cartella">
+              <svg viewBox="0 0 24 24"><path d="M4 7h16v3H4zM6 10v9h12v-9M10 14h4"/></svg>
+              Archiviazione
+            </button>
+          </div>
+          <button class="btn primary" id="btn-tutti">
+            <svg viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14"/></svg>
+            <span id="btn-tutti-testo">Aggiorna tutti</span>
+          </button>
+        </div>
+        <div class="toolbar-right">
+          <div class="tag-chips" id="tag-chips"></div>
+          <button class="btn ghost" id="btn-controlla" title="Chiede di nuovo a GitHub l'ultima release di ogni repository">Controlla</button>
+          <button class="btn" id="btn-aggiungi">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Aggiungi repository
+          </button>
+        </div>
+      </div>
+
+      <p class="nota modo-nota" id="modo-nota"></p>
+      <div class="banner" id="banner" hidden></div>
+
+      <section class="profiles" id="lista"></section>
+
+      <div class="empty" id="vuoto" hidden>
+        <svg viewBox="0 0 24 24"><path d="M5 5h14v4H5zM5 10h14v4H5zM5 15h14v4H5z"/></svg>
+        <p>Nessun repository.</p>
+        <p class="hint">Premi <strong>Aggiungi repository</strong> e indica un repository di GitHub.</p>
+      </div>
+    </main>
+
+    <aside class="log-panel" id="log-panel" hidden>
+      <div class="log-header">
+        <span>Registro</span>
+        <div>
+          <button class="btn ghost small" id="btn-log-pulisci">Pulisci</button>
+          <button class="btn ghost small" id="btn-log-chiudi">Chiudi</button>
+        </div>
+      </div>
+      <pre class="log-body" id="log-body"></pre>
+    </aside>
+  </div>
+
+  <footer class="statusbar">
+    <span id="stato-testo">Pronto</span>
+    <span id="file-config" class="config-path" title=""></span>
+  </footer>
+
+  <!-- repository: nuovo o modifica -->
+  <div class="modal-overlay" id="dlg-repo" hidden>
+    <div class="modal">
+      <h2 id="repo-titolo">Nuovo repository</h2>
+      <label class="field" id="repo-campo-repo">
+        <span>Repository di GitHub <em>(proprietario/nome, o l'indirizzo copiato dal browser)</em></span>
+        <input type="text" id="repo-repo" placeholder="storytold/photocraft" spellcheck="false" autocomplete="off" />
+      </label>
+      <label class="field" id="repo-campo-nome">
+        <span>Nome <em>(vuoto = nome del repository)</em></span>
+        <input type="text" id="repo-nome" spellcheck="false" autocomplete="off" />
+      </label>
+      <label class="switch-row">
+        <span>Repository privato <em>(serve una chiave di accesso)</em></span>
+        <input type="checkbox" id="repo-privato" /><i></i>
+      </label>
+      <div class="field" id="repo-campo-chiave" hidden>
+        <span class="field-label">Chiave di accesso <em>(token GitHub in sola lettura, meglio uno solo per questo repository)</em></span>
+        <input type="password" id="repo-chiave" spellcheck="false" autocomplete="off" />
+        <span class="nota" id="repo-chiave-nota"></span>
+      </div>
+      <label class="field">
+        <span>Tag <em>(per raggruppare i repository nella lista)</em></span>
+        <input type="text" id="repo-tag" list="repo-tag-noti" spellcheck="false" autocomplete="off" />
+        <datalist id="repo-tag-noti"></datalist>
+      </label>
+      <div class="field">
+        <span class="field-label">Archiviazione: cartella <em>(una sottocartella per ogni release; vuota = non si archivia)</em></span>
+        <div class="riga-cartella">
+          <input type="text" id="repo-cartella" spellcheck="false" autocomplete="off" />
+          <button class="btn" id="repo-scegli">Scegli…</button>
+        </div>
+      </div>
+      <label class="switch-row">
+        <span>Update: tieni aggiornato questo programma</span>
+        <input type="checkbox" id="repo-aggiorna" /><i></i>
+      </label>
+      <div class="field" id="repo-campo-ambito">
+        <span class="field-label">Dove installarlo su questo computer</span>
+        <div class="scelta" id="repo-ambito">
+          <button data-ambito="utente"><strong>Solo per me</strong><span id="amb-utente"></span></button>
+          <button data-ambito="sistema"><strong>Per tutto il computer</strong><span id="amb-sistema"></span></button>
+        </div>
+      </div>
+      <label class="field" id="repo-campo-asset">
+        <span>Pacchetto da installare <em>(facoltativo: CentralHub lo riconosce da solo dal nome)</em></span>
+        <input type="text" id="repo-asset" placeholder="per esempio *-Linux-x86_64.AppImage" spellcheck="false" autocomplete="off" />
+      </label>
+      <div class="banner error" id="repo-errore" hidden></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="repo-annulla">Annulla</button>
+        <button class="btn primary" id="repo-salva">Salva</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- esportazione: con o senza le chiavi -->
+  <div class="modal-overlay" id="dlg-esporta" hidden>
+    <div class="modal confirm-modal">
+      <h2>Esporta la configurazione</h2>
+      <div class="confirm-body" id="esp-corpo"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="esp-annulla">Annulla</button>
+        <button class="btn" id="esp-senza">Senza le chiavi</button>
+        <button class="btn primary" id="esp-con">Con le chiavi</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- dove installare: si chiede alla prima installazione -->
+  <div class="modal-overlay" id="dlg-ambito" hidden>
+    <div class="modal confirm-modal">
+      <h2 id="ambito-titolo"></h2>
+      <div class="confirm-body">Si sceglie una volta per programma; si può cambiare da «Modifica».</div>
+      <div class="scelta colonna" id="ambito-scelta">
+        <button data-ambito="utente"><strong>Solo per me</strong><span id="amb2-utente"></span></button>
+        <button data-ambito="sistema"><strong>Per tutto il computer</strong><span id="amb2-sistema"></span></button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="ambito-annulla">Annulla</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- installazione: quale versione, quale pacchetto, dove -->
+  <div class="modal-overlay" id="dlg-installa" hidden>
+    <div class="modal confirm-modal">
+      <h2 id="inst-titolo"></h2>
+      <p class="nota" id="inst-avviso" hidden></p>
+      <label class="field">
+        <span>Versione <em id="inst-versioni-nota"></em></span>
+        <select id="inst-versione"></select>
+      </label>
+      <div class="field">
+        <span class="field-label">Pacchetto <em id="inst-pacchetti-nota"></em></span>
+        <div class="scelta colonna" id="inst-pacchetti"></div>
+      </div>
+      <div class="field" id="inst-campo-ambito">
+        <span class="field-label">Dove installarlo <em>(si può cambiare da «Modifica»)</em></span>
+        <div class="scelta colonna" id="inst-ambito">
+          <button data-ambito="utente"><strong>Solo per me</strong><span id="amb3-utente"></span></button>
+          <button data-ambito="sistema"><strong>Per tutto il computer</strong><span id="amb3-sistema"></span></button>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="inst-annulla">Annulla</button>
+        <button class="btn primary" id="inst-ok">Installa</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- conferma -->
+  <div class="modal-overlay" id="dlg-conferma" hidden>
+    <div class="modal confirm-modal">
+      <h2 id="conf-titolo"></h2>
+      <div class="confirm-body" id="conf-corpo"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="conf-annulla">Annulla</button>
+        <button class="btn primary" id="conf-ok"></button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

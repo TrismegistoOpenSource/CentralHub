@@ -1,0 +1,15 @@
+# Wails crea queste cartelle dentro il sorgente: scripts/build.sh toglie
+# build/, frontend/wailsjs resta per go vet e go test. Non devono mai finire
+# in un commit. L'interfaccia (HTML/CSS/JS senza passo di build) sta in
+# frontend/ui.
+build/
+frontend/wailsjs/
+*.log
+.DS_Store
+
+# Binari lasciati da "go build" nella root del modulo
+/CentralHub
+/CentralHub.exe
+/centralhub
+/githubfinto
+/githubfinto.exe

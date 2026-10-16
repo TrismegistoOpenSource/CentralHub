@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: MIT
+
+name: Build CentralHub
+
+# Solo build e release, solo sui tag v*. I test NON girano qui: li hanno già
+# fatti in locale le tre macchine, ognuna sul proprio sistema, sullo stesso
+# sorgente (scripts/ci-locale.sh, attestati con l'impronta del sorgente), e
+# scripts/pubblica-release.sh fa il commit e il push del tag solo con i tre
+# attestati verdi. Così ogni versione costa un solo run (minuti: macOS x10,
+# Windows x2). Un push su main non fa partire niente.
+#
+# I passi sono GLI STESSI delle prove locali, perché sono gli stessi script:
+# scripts/build.sh, scripts/pacchetto.sh, scripts/verifica-pacchetto.sh.
+# Qui si aggiungono solo l'installazione degli strumenti e il caricamento.
+# CentralHub non ha un frontend da compilare (frontend/ui è sorgente): niente Node.
+
+on:
+  push:
+    tags: ["v*"]
+
+# Un tag non va mai interrotto a metà: niente cancel-in-progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # serve al job release per pubblicare gli asset
+
+env:
+  WAILS_VERSION: v2.13.0
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-latest
+            nome: macOS
+          - os: ubuntu-latest
+            nome: Linux
+          - os: windows-latest
+            nome: Windows
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Pacchetti di sviluppo Linux
+        if: matrix.os == 'ubuntu-latest'
+        # apt-get update tollerato: i repo di terze parti dei runner a volte
+        # falliscono; il cancello vero è apt-get install (PROBLEMI-NOTI.md §9).
+        run: |
+          sudo apt-get update -o Acquire::Retries=3 || true
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential pkg-config
+
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Build (scripts/build.sh, come in locale)
+        run: bash scripts/build.sh
+
+      - name: Pacchetto (scripts/pacchetto.sh, come in locale)
+        run: bash scripts/pacchetto.sh
+
+      - name: Verifica del pacchetto come lo riceve l'utente (come in locale)
+        run: bash scripts/verifica-pacchetto.sh
+
+      - name: Artefatti della release
+        run: |
+          set -e
+          source scripts/progetto.conf
+          case "${{ matrix.os }}" in
+            macos-latest) a="$ARTEFATTI_macos" ;;
+            ubuntu-latest) a="$ARTEFATTI_linux" ;;
+            windows-latest) a="$ARTEFATTI_windows" ;;
+          esac
+          mkdir -p dist
+          for f in $a; do cp "../build/$f" dist/; done
+          ls -la dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: CentralHub-${{ matrix.nome }}
+          path: dist/*
+          retention-days: 3
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+      - name: Elenca cosa verrà pubblicato
+        run: find artifacts -type f
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*/*
+          generate_release_notes: true

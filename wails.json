@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "CentralHub",
+  "outputfilename": "CentralHub",
+  "frontend:install": "",
+  "frontend:build": "",
+  "author": {
+    "name": "TrismegistoOpenSource"
+  },
+  "info": {
+    "companyName": "Trismegisto Open Source",
+    "productName": "CentralHub",
+    "productVersion": "0.2.0",
+    "copyright": "© 2026 Trismegisto Open Source — MIT",
+    "comments": "Scarica, installa e aggiorna le ultime release dai repository GitHub"
+  }
+}
