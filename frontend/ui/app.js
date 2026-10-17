@@ -727,8 +727,9 @@ async function avvia() {
   window.runtime.EventsOn("repo", (v) => { metti(v); ridisegna(v.id); });
   window.runtime.EventsOn("log", riga);
   await ricarica();
-  // All'apertura: c'è qualcosa da aggiornare?
-  api().ControllaTutti();
+  // All'apertura: c'è qualcosa da aggiornare? Solo se l'ultimo controllo è
+  // di più di un'ora fa; «Controlla» lo fa sempre.
+  api().ControllaAllApertura();
 }
 
 avvia().catch((e) => barra("Avvio non riuscito: " + messaggio(e), true));

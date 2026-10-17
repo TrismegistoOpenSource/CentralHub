@@ -817,10 +817,45 @@ func (a *App) Controlla(id string) {
 	}()
 }
 
-// ControllaTutti lo fa per tutti i repository: è ciò che succede all'apertura.
+// chiaveControllo è dove, in stato.json, sta l'istante dell'ultimo controllo
+// di tutti i repository (non è un esito di lavoro: ha la stessa forma per
+// comodità, e nessun ID di repository può essere uguale).
+const chiaveControllo = "@controllo"
+
+// intervalloApertura: all'apertura si controlla solo se l'ultimo controllo
+// è più vecchio di così. GitHub concede 60 richieste all'ora per computer ai
+// repository senza chiave, una per repository a ogni controllo.
+const intervalloApertura = time.Hour
+
+// ControllaAllApertura è il controllo che si fa aprendo l'app: parte solo se
+// l'ultimo controllo (di una sessione precedente o di questa) risale a più di
+// un'ora fa. Restituisce se è partito. «Controlla» chiama invece
+// ControllaTutti, che controlla sempre.
+func (a *App) ControllaAllApertura() bool {
+	a.mu.Lock()
+	e, ok := a.esiti[chiaveControllo]
+	a.mu.Unlock()
+	if ok {
+		if t, err := time.Parse(time.RFC3339, e.Quando); err == nil {
+			// un orologio spostato indietro non deve bloccare i controlli
+			if d := time.Since(t); d >= 0 && d < intervalloApertura {
+				return false
+			}
+		}
+	}
+	a.ControllaTutti()
+	return true
+}
+
+// ControllaTutti lo fa per tutti i repository, senza guardare quando è stato
+// fatto l'ultima volta, e ne ricorda l'istante.
 func (a *App) ControllaTutti() {
 	a.mu.Lock()
 	voci := a.voci()
+	if len(voci) > 0 {
+		a.esiti[chiaveControllo] = config.Esito{OK: true, Quando: time.Now().Format(time.RFC3339)}
+		_ = config.SalvaEsiti(a.esiti)
+	}
 	a.mu.Unlock()
 	for _, v := range voci {
 		a.Controlla(v.ID)

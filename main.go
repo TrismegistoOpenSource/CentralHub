@@ -15,7 +15,7 @@ import (
 )
 
 // Versione dell'app: la stessa di wails.json.
-const Versione = "0.2.0"
+const Versione = "0.2.1"
 
 //go:embed all:frontend/ui
 var assets embed.FS

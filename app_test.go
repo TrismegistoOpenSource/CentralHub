@@ -782,3 +782,82 @@ func TestNomeEsportazione(t *testing.T) {
 		t.Errorf("senza le chiavi: %s", got)
 	}
 }
+
+// attendi aspetta che nessun repository stia più lavorando (i controlli
+// partono in background).
+func (e *ambiente) attendi() {
+	e.t.Helper()
+	for i := 0; i < 500; i++ {
+		e.app.mu.Lock()
+		n := len(e.app.lavori)
+		e.app.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	e.t.Fatal("i controlli non sono finiti")
+}
+
+func TestControlloAllAperturaSoloOgniOra(t *testing.T) {
+	e := nuovoAmbiente(t)
+	v := e.aggiungi(config.Locale{Aggiorna: true})
+	repo := v.Repo
+	e.visti = map[string]string{}
+
+	// prima apertura: nessun controllo ricordato, si controlla
+	if !e.app.ControllaAllApertura() {
+		t.Fatal("la prima apertura deve controllare")
+	}
+	e.attendi()
+	if _, ok := e.visti[repo]; !ok {
+		t.Fatal("la prima apertura non ha interrogato GitHub")
+	}
+
+	// riapertura subito dopo, anche da una sessione nuova (stato.json riletto)
+	e.visti = map[string]string{}
+	e.app = NuovaApp()
+	e.app.nuovoCli = func(token string) *github.Client {
+		c := github.Nuovo(token, "CentralHub-prova")
+		c.Base = e.srv.URL
+		return c
+	}
+	e.app.carica()
+	if e.app.ControllaAllApertura() {
+		t.Fatal("meno di un'ora dopo non si deve controllare")
+	}
+	e.attendi()
+	if len(e.visti) != 0 {
+		t.Errorf("GitHub interrogato lo stesso: %v", e.visti)
+	}
+
+	// «Controlla» controlla sempre
+	e.app.ControllaTutti()
+	e.attendi()
+	if _, ok := e.visti[repo]; !ok {
+		t.Error("Controlla deve interrogare GitHub anche entro l'ora")
+	}
+
+	// più di un'ora dopo l'ultimo controllo, si torna a controllare
+	e.visti = map[string]string{}
+	e.app.mu.Lock()
+	e.app.esiti[chiaveControllo] = config.Esito{OK: true, Quando: time.Now().Add(-61 * time.Minute).Format(time.RFC3339)}
+	e.app.mu.Unlock()
+	if !e.app.ControllaAllApertura() {
+		t.Fatal("dopo più di un'ora si deve controllare")
+	}
+	e.attendi()
+	if _, ok := e.visti[repo]; !ok {
+		t.Error("dopo un'ora GitHub non è stato interrogato")
+	}
+
+	// un orologio spostato indietro (istante nel futuro) non blocca i controlli
+	e.visti = map[string]string{}
+	e.app.mu.Lock()
+	e.app.esiti[chiaveControllo] = config.Esito{OK: true, Quando: time.Now().Add(3 * time.Hour).Format(time.RFC3339)}
+	e.app.mu.Unlock()
+	if !e.app.ControllaAllApertura() {
+		t.Error("un istante nel futuro non deve bloccare il controllo")
+	}
+	e.attendi()
+}
