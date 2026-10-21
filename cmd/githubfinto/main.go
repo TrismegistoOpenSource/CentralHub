@@ -25,6 +25,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -94,7 +96,8 @@ func main() {
 				voci, _ := os.ReadDir(filepath.Join(dir, t))
 				for _, v := range voci {
 					if fi, err := v.Info(); err == nil && !v.IsDir() && !strings.HasPrefix(v.Name(), ".") {
-						rel.Assets = append(rel.Assets, github.Asset{Nome: v.Name(), Dimensione: fi.Size(),
+						// come GitHub, che dà il digest di ogni file: senza, CentralHub non installa
+						rel.Assets = append(rel.Assets, github.Asset{Nome: v.Name(), Dimensione: fi.Size(), Digest: sommaDi(filepath.Join(dir, t, v.Name())),
 							URL: base + "/file/" + parti[1] + "/" + parti[2] + "/" + t + "/" + v.Name()})
 					}
 				}
@@ -142,4 +145,18 @@ func main() {
 	})
 	log.Printf("GitHub finto su %s, release da %s", base, *radice)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", *porta), nil))
+}
+
+// sommaDi è il digest di un file nella forma di GitHub ("sha256:<esadecimale>").
+func sommaDi(percorso string) string {
+	f, err := os.Open(percorso)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }

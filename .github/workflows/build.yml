@@ -98,7 +98,14 @@ jobs:
           path: artifacts
       - name: Elenca cosa verrà pubblicato
         run: find artifacts -type f
+      - name: Somme di controllo (SHA-256)
+        run: |
+          cd artifacts
+          find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum | sed 's|  \./[^/]*/|  |' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v3
         with:
-          files: artifacts/*/*
+          files: |
+            artifacts/*/*
+            artifacts/SHA256SUMS.txt
           generate_release_notes: true

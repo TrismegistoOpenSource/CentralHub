@@ -18,9 +18,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"centralhub/internal/github"
 )
+
+func init() {
+	// le prove non aspettano secondi fra un tentativo e l'altro
+	attesaIniziale, attesaMassima = time.Millisecond, 4*time.Millisecond
+}
 
 // finto è un GitHub di prova: l'API su un server, i file su un altro (come
 // fa GitHub, che rimanda gli asset a un dominio di storage).
@@ -29,6 +35,9 @@ type finto struct {
 	contenuti    map[string][]byte // nome asset -> contenuto
 	digest       map[string]string
 	tronca       string // asset servito a metà
+	troncaUna    string // asset servito a metà solo la prima volta
+	senzaRange   bool   // il server ignora Range e manda sempre il file intero
+	ranges       []string
 	token        string // se non vuoto, l'API lo pretende
 	tokenFuori   atomic.Bool
 	stato        int // se non zero, risposta fissa dell'API a /releases/latest
@@ -61,13 +70,32 @@ func nuovoFinto(t *testing.T) *finto {
 		f.mu.Lock()
 		f.serviti[nome]++
 		f.mu.Unlock()
-		if nome == f.tronca {
+		f.mu.Lock()
+		prima := f.serviti[nome] == 1
+		if rg := r.Header.Get("Range"); rg != "" {
+			f.ranges = append(f.ranges, rg)
+		}
+		f.mu.Unlock()
+		if nome == f.tronca || (nome == f.troncaUna && prima) {
 			w.Header().Set("Content-Length", fmt.Sprint(len(b)))
 			w.Write(b[:len(b)/2])
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
 			}
 			panic(http.ErrAbortHandler) // chiude la connessione a metà
+		}
+		if rg := r.Header.Get("Range"); rg != "" && !f.senzaRange {
+			var da int
+			if _, err := fmt.Sscanf(rg, "bytes=%d-", &da); err != nil || da < 0 || da >= len(b) {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(b)))
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", da, len(b)-1, len(b)))
+			w.Header().Set("Content-Length", fmt.Sprint(len(b)-da))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(b[da:])
+			return
 		}
 		w.Write(b)
 	}))
@@ -172,13 +200,20 @@ func TestScaricaTuttiGliAssetSeparati(t *testing.T) {
 		t.Errorf("risultato: %+v", ris)
 	}
 	got := strings.Join(elenco(t, ris.Cartella), " ")
-	atteso := "App-Linux-x86_64.AppImage App-Windows.zip App-v1.2.0-sorgente.tar.gz App-v1.2.0-sorgente.zip"
+	// più il file nascosto con le somme con cui i pacchetti sono stati verificati
+	atteso := ".centralhub-sha256.txt App-Linux-x86_64.AppImage App-Windows.zip App-v1.2.0-sorgente.tar.gz App-v1.2.0-sorgente.zip"
 	if got != atteso {
 		t.Errorf("file scaricati:\n %s\natteso:\n %s", got, atteso)
 	}
 	b, _ := os.ReadFile(filepath.Join(ris.Cartella, "App-Windows.zip"))
 	if len(b) != 600_000 {
 		t.Errorf("asset di %d byte", len(b))
+	}
+	if len(ris.Verificati) != 2 || len(ris.NonVerificati) != 0 {
+		t.Errorf("verificati %v, non verificati %v", ris.Verificati, ris.NonVerificati)
+	}
+	if s := SommeArchiviate(master, "v1.2.0"); len(s) != 2 || s["App-Windows.zip"] == "" {
+		t.Errorf("somme annotate nell'archivio: %v", s)
 	}
 	if avvisi < 2 {
 		t.Errorf("avanzamento segnalato %d volte", avvisi)
@@ -202,6 +237,7 @@ func TestDownloadInterrottoRiparteDaDoveEra(t *testing.T) {
 	f.aggiungi("a-buono.zip", "contenuto buono")
 	f.aggiungi("b-rotto.zip", strings.Repeat("x", 100_000))
 	f.tronca = "b-rotto.zip"
+	f.senzaRange = true // questo server non sa riprendere a metà: il tentativo si ripete da capo e fallisce
 	c := f.client("")
 	master := t.TempDir()
 	r, err := c.Ultima(context.Background(), "a/App")
@@ -220,7 +256,7 @@ func TestDownloadInterrottoRiparteDaDoveEra(t *testing.T) {
 		t.Error("una release a metà non deve risultare scaricata")
 	}
 	da := elenco(t, filepath.Join(master, ".v1.2.0.parziale"))
-	if strings.Join(da, " ") != "a-buono.zip" || TenutiDaParte(master, r.Tag) != 1 {
+	if strings.Join(da, " ") != "a-buono.zip b-rotto.zip.part" || TenutiDaParte(master, r.Tag) != 1 {
 		t.Errorf("tenuti da parte: %v", da)
 	}
 	// il tentativo successivo non riscarica ciò che c'è già
@@ -232,7 +268,7 @@ func TestDownloadInterrottoRiparteDaDoveEra(t *testing.T) {
 	if f.serviti["a-buono.zip"] != 1 {
 		t.Errorf("il file già scaricato è stato chiesto %d volte", f.serviti["a-buono.zip"])
 	}
-	if len(ris.File) != 4 || len(elenco(t, ris.Cartella)) != 4 || TenutiDaParte(master, r.Tag) != 0 {
+	if len(ris.File) != 4 || len(elenco(t, ris.Cartella)) != 5 || TenutiDaParte(master, r.Tag) != 0 {
 		t.Errorf("release completa: %v", ris.File)
 	}
 	if n := strings.Join(elenco(t, master), " "); n != "v1.2.0" {
@@ -280,7 +316,7 @@ func TestDigestSbagliatoRifiutato(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "SHA-256") {
 		t.Fatalf("atteso errore di SHA-256, avuto %v", err)
 	}
-	if Presente(master, r.Tag) || TenutiDaParte(master, r.Tag) != 0 {
+	if Presente(master, r.Tag) || len(elenco(t, filepath.Join(master, ".v1.2.0.parziale"))) != 0 {
 		t.Errorf("un file che non corrisponde non si tiene: %v", elenco(t, filepath.Join(master, ".v1.2.0.parziale")))
 	}
 }
@@ -297,7 +333,101 @@ func TestAnnullamento(t *testing.T) {
 		t.Fatalf("atteso annullamento, avuto %v", err)
 	}
 	if Presente(master, r.Tag) || TenutiDaParte(master, r.Tag) != 0 {
-		t.Errorf("dopo l'annullamento non resta nessun file a metà: %v", elenco(t, filepath.Join(master, ".v1.2.0.parziale")))
+		t.Errorf("dopo l'annullamento la release non c'è e nessun file è intero: %v", elenco(t, filepath.Join(master, ".v1.2.0.parziale")))
+	}
+	// ciò che era arrivato resta (".part") e il tentativo dopo riprende da lì
+	parti := elenco(t, filepath.Join(master, ".v1.2.0.parziale"))
+	if len(parti) != 1 || parti[0] != "App.zip.part" {
+		t.Fatalf("il file a metà doveva restare per riprendere: %v", parti)
+	}
+	ris, err := Scarica(context.Background(), c, "a/App", r, master, nil)
+	if err != nil || len(ris.File) != 3 {
+		t.Fatalf("ripresa dopo l'annullamento: %+v %v", ris, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.ranges) == 0 {
+		t.Error("la ripresa doveva chiedere solo il resto del file (Range)")
+	}
+}
+
+// Un download che cade a metà riprende da dove era da solo, con una richiesta
+// Range, senza ricominciare il file.
+func TestCadutaDiConnessioneRiprendeAMeta(t *testing.T) {
+	f := nuovoFinto(t)
+	grande := strings.Repeat("0123456789", 50_000)
+	f.aggiungi("Grande.zip", grande)
+	f.troncaUna = "Grande.zip"
+	c := f.client("")
+	r, _ := c.Ultima(context.Background(), "a/App")
+	dir := t.TempDir()
+	var asset github.Asset
+	for _, a := range r.Assets {
+		if a.Nome == "Grande.zip" {
+			asset = a
+		}
+	}
+	file, err := Asset(context.Background(), c, "a/App", asset, dir, nil)
+	if err != nil {
+		t.Fatalf("la caduta doveva essere assorbita: %v", err)
+	}
+	if b, _ := os.ReadFile(file); string(b) != grande {
+		t.Fatalf("file ricostruito sbagliato (%d byte)", len(b))
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.ranges) != 1 || !strings.HasPrefix(f.ranges[0], "bytes=") || f.ranges[0] == "bytes=0-" {
+		t.Errorf("la ripresa doveva chiedere il resto: %v", f.ranges)
+	}
+	if f.serviti["Grande.zip"] != 2 {
+		t.Errorf("il file è stato chiesto %d volte, attese 2", f.serviti["Grande.zip"])
+	}
+	if n := elenco(t, dir); len(n) != 1 {
+		t.Errorf("nella cartella di lavoro: %v", n)
+	}
+}
+
+// Senza nessuna somma di controllo un pacchetto non si installa; il server
+// che ignora Range fa ricominciare il file, senza corromperlo.
+func TestSenzaSommaNonSiInstallaEServerSenzaRange(t *testing.T) {
+	f := nuovoFinto(t)
+	f.aggiungi("App.zip", "contenuto")
+	f.digest["App.zip"] = ""
+	c := f.client("")
+	r, _ := c.Ultima(context.Background(), "a/App")
+	var asset github.Asset
+	for _, a := range r.Assets {
+		if a.Nome == "App.zip" {
+			asset = a
+		}
+	}
+	if _, err := Asset(context.Background(), c, "a/App", asset, t.TempDir(), nil); !errors.Is(err, ErrSenzaSomma) {
+		t.Errorf("senza somma deve rifiutare: %v", err)
+	}
+	// ma l'archiviazione lo scarica e dice che non l'ha potuto verificare
+	ris, err := Scarica(context.Background(), c, "a/App", r, t.TempDir(), nil)
+	if err != nil || len(ris.NonVerificati) != 1 || ris.NonVerificati[0] != "App.zip" {
+		t.Errorf("archiviazione senza somma: %+v %v", ris, err)
+	}
+
+	// server che ignora Range: il file parziale viene riscritto da capo
+	f2 := nuovoFinto(t)
+	f2.aggiungi("G.zip", strings.Repeat("ab", 100_000))
+	f2.troncaUna, f2.senzaRange = "G.zip", true
+	c2 := f2.client("")
+	r2, _ := c2.Ultima(context.Background(), "a/App")
+	var a2 github.Asset
+	for _, a := range r2.Assets {
+		if a.Nome == "G.zip" {
+			a2 = a
+		}
+	}
+	file, err := Asset(context.Background(), c2, "a/App", a2, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(file); string(b) != strings.Repeat("ab", 100_000) {
+		t.Errorf("un server senza Range non deve corrompere il file (%d byte)", len(b))
 	}
 }
 

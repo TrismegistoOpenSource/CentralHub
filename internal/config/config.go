@@ -70,6 +70,11 @@ type Repo struct {
 	// Privato: il repository richiede una chiave di accesso. Resta vero anche
 	// in un file esportato senza chiavi, così chi lo importa sa che gli manca.
 	Privato bool `json:"privato,omitempty"`
+	// PretendiFirma: si installa solo se il SHA256SUMS.txt della release è
+	// firmato con una delle chiavi di cui CentralHub si fida (quelle di chi
+	// pubblica i propri programmi). Una release non firmata, o con una firma
+	// che non torna, viene rifiutata.
+	PretendiFirma bool `json:"pretendiFirma,omitempty"`
 	// Token è la chiave di accesso (token GitHub in sola lettura). Vuoto se il
 	// repository è pubblico, se la chiave non è stata ancora messa o se il
 	// file è stato esportato senza chiavi.
@@ -431,4 +436,35 @@ func SalvaEsiti(m map[string]Esito) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(d, nomeStato))
+}
+
+// LeggiFileDiStato legge un file di stato (non la configurazione) dalla
+// cartella di configurazione. Nil se non c'è o non si legge.
+func LeggiFileDiStato(nome string) []byte {
+	d, _, err := Cartella()
+	if err != nil {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(d, nome))
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ScriviFileDiStato scrive un file di stato in modo atomico: o c'è il
+// vecchio o c'è il nuovo, mai uno a metà.
+func ScriviFileDiStato(nome string, b []byte) error {
+	d, _, err := Cartella()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		return err
+	}
+	tmp := filepath.Join(d, nome+".tmp")
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(d, nome))
 }

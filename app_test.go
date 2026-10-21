@@ -5,7 +5,12 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +22,7 @@ import (
 	"time"
 
 	"centralhub/internal/config"
+	"centralhub/internal/firma"
 	"centralhub/internal/github"
 	"centralhub/internal/installa"
 )
@@ -41,6 +47,30 @@ type ambiente struct {
 	// cestinati: ciò che una disinstallazione ha mandato nel cestino (qui
 	// finto: le prove non riempiono quello vero)
 	cestinati []string
+	// somme: come la release pubblica la somma di controllo del pacchetto:
+	// "" o "digest" = il digest di GitHub; "file" = solo SHA256SUMS.txt;
+	// "sbagliata" = SHA256SUMS.txt con una somma che non torna; "nessuna" = niente
+	somme string
+	// firma: "" = non firmata; "valida" = SHA256SUMS.txt.sig con la chiave
+	// fidata; "altra" = firmata con un'altra chiave; "alterata" = firma giusta
+	// ma le somme sono state cambiate dopo (firma che non torna)
+	firma string
+	// pubblicata: data di pubblicazione delle release finte (RFC 3339); vuota = non indicata
+	pubblicata string
+	web        bool // il sito pubblico finto risponde: i repository sono "gratis"
+	// quante richieste ha avuto l'API e quante il sito (la sonda del tag)
+	api, sonda    int
+	fatti         map[string][]byte
+	chiaveDiProva ed25519.PrivateKey
+}
+
+// testoSomme è il SHA256SUMS.txt che la release finta pubblica.
+func (e *ambiente) testoSomme(tag string) string {
+	somma := sha(e.pacchetto(tag))
+	if e.somme == "sbagliata" {
+		somma = strings.Repeat("0", 64)
+	}
+	return fmt.Sprintf("%s  %s\n", somma, e.nomeFile)
 }
 
 func nuovoAmbiente(t *testing.T) *ambiente {
@@ -56,6 +86,20 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 			return
 		}
 		repo := parti[1] + "/" + parti[2]
+		if parti[0] == "web" {
+			// il sito pubblico: /web/<o>/<r>/releases/latest rimanda al tag
+			e.sonda++
+			if len(parti) == 5 && parti[4] == "latest" {
+				w.Header().Set("Location", "/web/"+repo+"/releases/tag/"+e.tag)
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+		if parti[0] == "repos" {
+			e.api++
+		}
 		avuto := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		e.visti[repo] = avuto
 		if preteso := e.token[repo]; preteso != "" && avuto != preteso {
@@ -66,10 +110,20 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 		case "repos":
 			release := func(tag string) github.Release {
 				b := e.pacchetto(tag)
-				r := github.Release{Tag: tag, Nome: "Release " + tag, Assets: []github.Asset{
+				r := github.Release{Tag: tag, Nome: "Release " + tag, Pubblicata: e.pubblicata, Note: "Novità della " + tag, Assets: []github.Asset{
 					{Nome: e.nomeFile, Dimensione: int64(len(b)), URL: e.srv.URL + "/asset/" + repo + "/" + tag},
 					{Nome: "note.txt", Dimensione: 4, URL: e.srv.URL + "/note/" + repo},
 				}}
+				switch e.somme {
+				case "", "digest":
+					r.Assets[0].Digest = "sha256:" + sha(b)
+				case "file", "sbagliata":
+					r.Assets = append(r.Assets, github.Asset{Nome: "SHA256SUMS.txt", Dimensione: int64(len(e.testoSomme(tag))), URL: e.srv.URL + "/sums/" + repo + "/" + tag})
+				}
+				if e.firma != "" {
+					r.Assets = append(r.Assets, github.Asset{Nome: "SHA256SUMS.txt", Dimensione: int64(len(e.testoSomme(tag))), URL: e.srv.URL + "/sums/" + repo + "/" + tag},
+						github.Asset{Nome: "SHA256SUMS.txt.sig", Dimensione: 89, URL: e.srv.URL + "/sig/" + repo + "/" + tag})
+				}
 				for _, n := range e.extra {
 					r.Assets = append(r.Assets, github.Asset{Nome: n, Dimensione: 4, URL: e.srv.URL + "/note/" + repo})
 				}
@@ -91,15 +145,35 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 			w.Write(e.pacchetto(parti[3]))
 		case "note":
 			w.Write([]byte("note"))
+		case "sums":
+			w.Write([]byte(e.testoSomme(parti[3])))
+		case "sig":
+			testo := e.testoSomme(parti[3])
+			chiave := e.chiaveDiProva
+			if e.firma == "altra" {
+				_, chiave, _ = firma.Nuova()
+			}
+			sig, _ := firma.Firma(chiave, repo, parti[3], []byte(testo))
+			switch e.firma {
+			case "alterata":
+				// la firma è delle somme vere; quelle servite sono diverse
+				sig, _ = firma.Firma(chiave, repo, parti[3], []byte(strings.Replace(testo, e.nomeFile, "Altro.zip", 1)))
+			case "riusata":
+				// firma vera, ma fatta per un'altra release
+				sig, _ = firma.Firma(chiave, repo, "v0.0.1", []byte(testo))
+			case "estranea":
+				sig = "untrusted comment: firma di minisign\nRWQ..."
+			}
+			w.Write([]byte(sig + "\n"))
 		}
 	}))
 	t.Cleanup(e.srv.Close)
 	e.app = NuovaApp()
-	e.app.nuovoCli = func(token string) *github.Client {
-		c := github.Nuovo(token, "CentralHub-prova")
-		c.Base = e.srv.URL
-		return c
-	}
+	e.app.nuovoCli = e.cliente
+	pub, priv, _ := firma.Nuova()
+	e.chiaveDiProva = priv
+	chiaviFidate = func() []ed25519.PublicKey { return []ed25519.PublicKey{pub} }
+	t.Cleanup(func() { chiaviFidate = func() []ed25519.PublicKey { return firma.Fidate() } })
 	e.app.cestina = func(_, percorso string) error {
 		e.cestinati = append(e.cestinati, percorso)
 		return os.RemoveAll(percorso)
@@ -112,6 +186,34 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 // pacchetto costruisce l'asset installabile su questo sistema, con dentro il
 // tag (per riconoscere la versione installata).
 func (e *ambiente) pacchetto(tag string) []byte {
+	e.t.Helper()
+	if b, ok := e.fatti[tag]; ok {
+		return b
+	}
+	b := e.costruisci(tag)
+	if e.fatti == nil {
+		e.fatti = map[string][]byte{}
+	}
+	e.fatti[tag] = b // lo stesso per tutta la prova: la somma deve tornare
+	return b
+}
+
+func sha(b []byte) string {
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
+}
+
+// cliente è il client verso il GitHub finto; con e.web risponde anche il sito.
+func (e *ambiente) cliente(token string) *github.Client {
+	c := github.Nuovo(token, "CentralHub-prova")
+	c.Base = e.srv.URL
+	if e.web {
+		c.WebDiProva = e.srv.URL + "/web"
+	}
+	return c
+}
+
+func (e *ambiente) costruisci(tag string) []byte {
 	e.t.Helper()
 	dir := e.t.TempDir()
 	switch runtime.GOOS {
@@ -799,65 +901,475 @@ func (e *ambiente) attendi() {
 	e.t.Fatal("i controlli non sono finiti")
 }
 
-func TestControlloAllAperturaSoloOgniOra(t *testing.T) {
-	e := nuovoAmbiente(t)
-	v := e.aggiungi(config.Locale{Aggiorna: true})
-	repo := v.Repo
-	e.visti = map[string]string{}
+// nuovaSessione simula la chiusura e la riapertura del programma: stessa
+// configurazione su disco, memoria vuota.
+func (e *ambiente) nuovaSessione() {
+	e.app = NuovaApp()
+	e.app.nuovoCli = e.cliente
+	e.app.carica()
+}
 
-	// prima apertura: nessun controllo ricordato, si controlla
+func TestControlloAllAperturaPerChiCostaSoloOgniOra(t *testing.T) {
+	e := nuovoAmbiente(t) // senza sito: ogni controllo costa una richiesta all'API
+	v := e.aggiungi(config.Locale{Aggiorna: true})
+
+	// prima apertura: nulla ricordato, si controlla
 	if !e.app.ControllaAllApertura() {
 		t.Fatal("la prima apertura deve controllare")
 	}
 	e.attendi()
-	if _, ok := e.visti[repo]; !ok {
-		t.Fatal("la prima apertura non ha interrogato GitHub")
+	if e.api != 1 {
+		t.Fatalf("la prima apertura doveva costare una richiesta: %d", e.api)
 	}
 
-	// riapertura subito dopo, anche da una sessione nuova (stato.json riletto)
-	e.visti = map[string]string{}
-	e.app = NuovaApp()
-	e.app.nuovoCli = func(token string) *github.Client {
-		c := github.Nuovo(token, "CentralHub-prova")
-		c.Base = e.srv.URL
-		return c
-	}
-	e.app.carica()
+	// riapertura subito dopo, da una sessione nuova: niente richieste, ma i
+	// LED si ricordano dall'ultima volta
+	e.nuovaSessione()
 	if e.app.ControllaAllApertura() {
 		t.Fatal("meno di un'ora dopo non si deve controllare")
 	}
 	e.attendi()
-	if len(e.visti) != 0 {
-		t.Errorf("GitHub interrogato lo stesso: %v", e.visti)
+	if e.api != 1 {
+		t.Errorf("GitHub interrogato lo stesso: %d richieste", e.api)
+	}
+	if got := e.vista(v.ID); got.UltimaRelease != "v1.0.0" || got.UpdateAggiornato != "no" || got.VistaIl == "" {
+		t.Errorf("l'ultima release non si è ricordata fra le sessioni: %+v", got)
 	}
 
 	// «Controlla» controlla sempre
 	e.app.ControllaTutti()
 	e.attendi()
-	if _, ok := e.visti[repo]; !ok {
-		t.Error("Controlla deve interrogare GitHub anche entro l'ora")
+	if e.api != 2 {
+		t.Errorf("Controlla deve interrogare GitHub anche entro l'ora: %d", e.api)
 	}
 
 	// più di un'ora dopo l'ultimo controllo, si torna a controllare
-	e.visti = map[string]string{}
 	e.app.mu.Lock()
-	e.app.esiti[chiaveControllo] = config.Esito{OK: true, Quando: time.Now().Add(-61 * time.Minute).Format(time.RFC3339)}
+	e.app.visteIl[v.ID] = time.Now().Add(-61 * time.Minute)
 	e.app.mu.Unlock()
 	if !e.app.ControllaAllApertura() {
 		t.Fatal("dopo più di un'ora si deve controllare")
 	}
 	e.attendi()
-	if _, ok := e.visti[repo]; !ok {
-		t.Error("dopo un'ora GitHub non è stato interrogato")
+	if e.api != 3 {
+		t.Errorf("dopo un'ora GitHub non è stato interrogato: %d", e.api)
 	}
 
 	// un orologio spostato indietro (istante nel futuro) non blocca i controlli
-	e.visti = map[string]string{}
 	e.app.mu.Lock()
-	e.app.esiti[chiaveControllo] = config.Esito{OK: true, Quando: time.Now().Add(3 * time.Hour).Format(time.RFC3339)}
+	e.app.visteIl[v.ID] = time.Now().Add(3 * time.Hour)
 	e.app.mu.Unlock()
 	if !e.app.ControllaAllApertura() {
 		t.Error("un istante nel futuro non deve bloccare il controllo")
 	}
 	e.attendi()
+}
+
+func TestSondaDelSitoNonConsumaLaQuota(t *testing.T) {
+	e := nuovoAmbiente(t)
+	e.web = true
+	v := e.aggiungi(config.Locale{Aggiorna: true})
+
+	e.app.ControllaTutti()
+	e.attendi()
+	if e.api != 1 || e.sonda != 1 {
+		t.Fatalf("primo controllo: api %d sonda %d (serve l'API la prima volta)", e.api, e.sonda)
+	}
+	// stesso tag: lo dice il sito, l'API non si tocca
+	for i := 0; i < 3; i++ {
+		e.app.ControllaTutti()
+		e.attendi()
+	}
+	if e.api != 1 || e.sonda != 4 {
+		t.Errorf("a tag invariato non si deve usare l'API: api %d sonda %d", e.api, e.sonda)
+	}
+	// all'apertura i pubblici si controllano sempre, anche entro l'ora
+	if !e.app.ControllaAllApertura() {
+		t.Error("i repository pubblici si controllano a ogni apertura (non costa)")
+	}
+	e.attendi()
+	if e.api != 1 {
+		t.Errorf("l'apertura ha consumato quota: %d", e.api)
+	}
+	// esce una release nuova: la sonda se ne accorge e solo allora si chiede l'API
+	e.tag = "v1.1.0"
+	e.app.ControllaTutti()
+	e.attendi()
+	if got := e.vista(v.ID); got.UltimaRelease != "v1.1.0" || e.api != 2 {
+		t.Errorf("release nuova: %+v api %d", got, e.api)
+	}
+	// l'elenco dei pacchetti vecchio di un giorno si richiede comunque
+	e.app.mu.Lock()
+	e.app.prese[v.ID] = time.Now().Add(-25 * time.Hour)
+	e.app.mu.Unlock()
+	e.app.ControllaTutti()
+	e.attendi()
+	if e.api != 3 {
+		t.Errorf("elenco vecchio non rinnovato: api %d", e.api)
+	}
+	// se il sito non risponde si ripiega sull'API
+	e.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	e.app.ControllaTutti()
+	e.attendi()
+}
+
+func TestSommeDiControllo(t *testing.T) {
+	prova := func(somme string) (Vista, *ambiente) {
+		e := nuovoAmbiente(t)
+		e.somme = somme
+		v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente})
+		return e.aggiorna(v.ID, false), e
+	}
+	for _, c := range []string{"digest", "file"} {
+		if v, _ := prova(c); !v.EsitoUpdate.OK || v.Installato.Tag != "v1.0.0" {
+			t.Errorf("con le somme %q deve installare: %+v", c, v.EsitoUpdate)
+		}
+	}
+	v, _ := prova("nessuna")
+	if v.EsitoUpdate.OK || !strings.Contains(v.EsitoUpdate.Messaggio, "somma di controllo") || v.Installato.Presente {
+		t.Errorf("senza nessuna somma non si installa: %+v", v.EsitoUpdate)
+	}
+	v, _ = prova("sbagliata")
+	if v.EsitoUpdate.OK || !strings.Contains(v.EsitoUpdate.Messaggio, "non corrisponde") || v.Installato.Presente {
+		t.Errorf("una somma che non torna non si installa: %+v", v.EsitoUpdate)
+	}
+}
+
+func TestArchiviazioneVerificata(t *testing.T) {
+	e := nuovoAmbiente(t)
+	master := filepath.Join(e.base, "master")
+	v := e.aggiungi(config.Locale{CartellaArchivio: master})
+	if v = e.archivia(v.ID); !v.EsitoArchivio.OK || !strings.Contains(v.EsitoArchivio.Messaggio, "1 pacchetti verificati") ||
+		!strings.Contains(v.EsitoArchivio.Messaggio, "1 senza somma") {
+		t.Errorf("l'archiviazione deve dire cosa ha verificato (il pacchetto sì, note.txt non ha somma): %+v", v.EsitoArchivio)
+	}
+	// una somma che non torna ferma l'archiviazione
+	e2 := nuovoAmbiente(t)
+	e2.somme = "sbagliata"
+	master2 := filepath.Join(e2.base, "master")
+	v2 := e2.aggiungi(config.Locale{CartellaArchivio: master2})
+	if v2 = e2.archivia(v2.ID); v2.EsitoArchivio.OK || !strings.Contains(v2.EsitoArchivio.Messaggio, "non corrisponde") {
+		t.Errorf("un file che non torna non va archiviato: %+v", v2.EsitoArchivio)
+	}
+	if scarica := filepath.Join(master2, "v1.0.0"); func() bool { _, err := os.Stat(scarica); return err == nil }() {
+		t.Error("è comparsa la cartella della release con un file che non torna")
+	}
+}
+
+func TestInstallaDallArchivio(t *testing.T) {
+	e := nuovoAmbiente(t)
+	master := filepath.Join(e.base, "master")
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente, CartellaArchivio: master})
+	if s, err := e.app.Scelte(v.ID); err != nil || len(s.Archivio) != 0 {
+		t.Fatalf("senza archiviazione non c'è nulla da cui installare: %+v %v", s, err)
+	}
+	e.archivia(v.ID)
+	s, err := e.app.Scelte(v.ID)
+	if err != nil || len(s.Archivio) != 1 || s.Archivio[0].Tag != "v1.0.0" || len(s.Archivio[0].Pacchetti) != 1 || s.Archivio[0].Pacchetti[0].Nome != e.nomeFile {
+		t.Fatalf("l'archivio deve proporre la release archiviata: %+v %v", s.Archivio, err)
+	}
+	// senza rete: il server non c'è più
+	e.srv.Close()
+	// la finestra «Installa» deve poter offrire l'archivio: l'elenco di GitHub è vuoto ma
+	// non nil (nel JSON sarebbe null e l'interfaccia lo scorrerebbe: trovato sul sistema vero).
+	// Il controllo appena fatto si riuserebbe (scorciatoia): lo si invecchia, come dopo mezzo minuto.
+	e.app.mu.Lock()
+	e.app.visteIl[v.ID] = time.Now().Add(-time.Hour)
+	e.app.mu.Unlock()
+	s, err = e.app.Scelte(v.ID)
+	if err != nil || s.Release == nil || len(s.Release) != 0 || len(s.Archivio) != 1 || s.Avviso == "" {
+		t.Fatalf("senza GitHub Scelte deve dare Release vuoto (non nil), l'archivio e un avviso: %+v %v", s, err)
+	}
+	if j, _ := json.Marshal(s); !strings.Contains(string(j), `"release":[]`) {
+		t.Errorf("il JSON per l'interfaccia deve avere release:[]: %s", j)
+	}
+	v = e.installa(v.ID, Opzioni{Da: "archivio", Tag: "v1.0.0"})
+	if !v.EsitoUpdate.OK || v.Installato.Tag != "v1.0.0" || !v.Installato.Nostro {
+		t.Fatalf("installazione dall'archivio: %+v esito %+v", v.Installato, v.EsitoUpdate)
+	}
+	// l'archivio non si tocca
+	if _, err := os.Stat(filepath.Join(master, "v1.0.0", e.nomeFile)); err != nil {
+		t.Error("il pacchetto è sparito dall'archivio")
+	}
+}
+
+// Dopo un lavoro fallito la scheda mostra l'errore del lavoro, non quello
+// vecchio di un controllo.
+func TestErroreDelLavoroPrevaleSuQuelloDelControllo(t *testing.T) {
+	e := nuovoAmbiente(t)
+	v := e.aggiungi(config.Locale{CartellaArchivio: filepath.Join(e.base, "master")})
+	e.app.mu.Lock()
+	e.app.errori[v.ID] = "GitHub non è raggiungibile"
+	e.app.mu.Unlock()
+	e.app.fallito(context.Background(), e.voce(v.ID), modoUpdate, "v1.0.0", errors.New("il file scaricato non corrisponde a quello pubblicato"))
+	if got := e.vista(v.ID); got.Errore != "" || got.EsitoUpdate == nil || !strings.Contains(got.EsitoUpdate.Messaggio, "non corrisponde") {
+		t.Errorf("errore vecchio ancora in primo piano: errore %q esito %+v", got.Errore, got.EsitoUpdate)
+	}
+}
+
+func TestInstallaDallArchivioControllaLaSomma(t *testing.T) {
+	e := nuovoAmbiente(t)
+	master := filepath.Join(e.base, "master")
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente, CartellaArchivio: master})
+	e.archivia(v.ID)
+	// il file dell'archivio viene alterato
+	if err := os.WriteFile(filepath.Join(master, "v1.0.0", e.nomeFile), []byte("alterato"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v = e.installa(v.ID, Opzioni{Da: "archivio", Tag: "v1.0.0"})
+	if v.EsitoUpdate.OK || !strings.Contains(v.EsitoUpdate.Messaggio, "non corrisponde") || v.Installato.Presente {
+		t.Errorf("un file alterato nell'archivio non si installa: %+v", v.EsitoUpdate)
+	}
+	// una release che non c'è nell'archivio, o un nome con percorso
+	for _, tag := range []string{"v9.9.9", "../fuori"} {
+		if v = e.installa(v.ID, Opzioni{Da: "archivio", Tag: tag}); v.EsitoUpdate.OK {
+			t.Errorf("%q non è nell'archivio", tag)
+		}
+	}
+}
+
+func TestIndirizzoRepoENovita(t *testing.T) {
+	if u, err := indirizzoRepo("storytold/photocraft"); err != nil || u != "https://github.com/storytold/photocraft" {
+		t.Errorf("indirizzo: %q %v", u, err)
+	}
+	for _, male := range []string{"", "a b/c", "javascript:alert(1)"} {
+		if u, err := indirizzoRepo(male); err == nil {
+			t.Errorf("%q non è un repository: %q", male, u)
+		}
+	}
+	e := nuovoAmbiente(t)
+	v := e.aggiungi(config.Locale{})
+	if _, err := e.app.Novita(v.ID); err == nil {
+		t.Error("prima del controllo non ci sono note")
+	}
+	e.app.controlla(context.Background(), e.voce(v.ID))
+	if n, err := e.app.Novita(v.ID); err != nil || n.Tag != "v1.0.0" || n.Testo != "Novità della v1.0.0" {
+		t.Errorf("note: %+v %v", n, err)
+	}
+	if got := e.vista(v.ID); !got.HaNote {
+		t.Error("la scheda deve dire che ci sono delle note")
+	}
+}
+
+// prova installa la prima release con le impostazioni date. proprietarioFirma
+// rende «a» (il proprietario dei repository finti) uno di quelli che firmano.
+func provaFirma(t *testing.T, firma string, ctl func(e *ambiente), cfg func(r *config.Repo)) Vista {
+	t.Helper()
+	e := nuovoAmbiente(t)
+	e.firma = firma
+	if ctl != nil {
+		ctl(e)
+	}
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente})
+	if cfg != nil {
+		r := config.Repo{ID: v.ID, Nome: "Prova", Repo: "a/Prova", Locale: config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente}}
+		cfg(&r)
+		if _, err := e.app.SalvaRepo(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return e.aggiorna(v.ID, false)
+}
+
+func TestPretendiFirma(t *testing.T) {
+	pretendi := func(r *config.Repo) { r.PretendiFirma = true }
+	if v := provaFirma(t, "valida", nil, pretendi); !v.EsitoUpdate.OK || v.Installato.Tag != "v1.0.0" || !v.PretendiFirma {
+		t.Errorf("release firmata: %+v", v.EsitoUpdate)
+	}
+	for firma, dentro := range map[string]string{
+		"":         "non è firmata",
+		"altra":    "nessuna chiave fidata",
+		"alterata": "nessuna chiave fidata",
+		"riusata":  "nessuna chiave fidata",
+		"estranea": "non è nel formato di CentralHub",
+	} {
+		v := provaFirma(t, firma, nil, pretendi)
+		if v.EsitoUpdate.OK || v.Installato.Presente || !strings.Contains(v.EsitoUpdate.Messaggio, dentro) {
+			t.Errorf("firma %q: deve rifiutare con %q: %+v installato %v", firma, dentro, v.EsitoUpdate, v.Installato.Presente)
+		}
+	}
+}
+
+// La verifica è sempre attiva: una firma presente ma sbagliata fa rifiutare la
+// release anche se il repository non ha l'interruttore e non è di chi firma.
+func TestFirmaSbagliataSiRifiutaSempre(t *testing.T) {
+	for _, firma := range []string{"altra", "alterata", "riusata"} {
+		v := provaFirma(t, firma, nil, nil)
+		if v.EsitoUpdate.OK || v.Installato.Presente || !strings.Contains(v.EsitoUpdate.Messaggio, "nessuna chiave fidata") {
+			t.Errorf("firma %q senza interruttore: %+v", firma, v.EsitoUpdate)
+		}
+	}
+	// una firma in un altro formato non è nostra: si ignora e si usa il digest
+	if v := provaFirma(t, "estranea", nil, nil); !v.EsitoUpdate.OK {
+		t.Errorf("la firma di un altro programma non deve bloccare: %+v", v.EsitoUpdate)
+	}
+	// repository di terzi, senza firma: come prima
+	if v := provaFirma(t, "", nil, nil); !v.EsitoUpdate.OK || v.FirmaRichiesta {
+		t.Errorf("senza firma e senza obbligo: %+v richiesta=%v", v.EsitoUpdate, v.FirmaRichiesta)
+	}
+}
+
+// Togliere la firma non basta a farla ignorare.
+func TestFirmaTolta(t *testing.T) {
+	// 1. proprietario che firma: dopo la data, senza firma si rifiuta
+	nostro := func(e *ambiente) {
+		vecchi := proprietariFirmati
+		proprietariFirmati = []string{"a"}
+		t.Cleanup(func() { proprietariFirmati = vecchi })
+		e.pubblicata = firmaObbligatoriaDal.Add(time.Hour).Format(time.RFC3339)
+	}
+	v := provaFirma(t, "", nostro, nil)
+	if v.EsitoUpdate.OK || v.Installato.Presente || !strings.Contains(v.EsitoUpdate.Messaggio, "obbligatoria") || !v.FirmaRichiesta {
+		t.Errorf("proprietario che firma, release nuova senza firma: %+v", v.EsitoUpdate)
+	}
+	// una release di prima della firma si installa ancora
+	vecchia := func(e *ambiente) {
+		nostro(e)
+		e.pubblicata = firmaObbligatoriaDal.Add(-24 * time.Hour).Format(time.RFC3339)
+	}
+	if v := provaFirma(t, "", vecchia, nil); !v.EsitoUpdate.OK {
+		t.Errorf("release di prima della firma: %+v", v.EsitoUpdate)
+	}
+	// 2. a trinquete: visto un repository firmare, da lì non scende più
+	e := nuovoAmbiente(t)
+	e.firma = "valida"
+	id := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente}).ID
+	if v := e.aggiorna(id, false); !v.EsitoUpdate.OK || !v.PretendiFirma {
+		t.Fatalf("release firmata: %+v pretendi=%v", v.EsitoUpdate, v.PretendiFirma)
+	}
+	e.nuovaSessione() // l'interruttore è nella configurazione, sopravvive
+	if !e.vista(id).PretendiFirma {
+		t.Fatal("l'interruttore doveva restare acceso dopo il riavvio")
+	}
+	e.firma = ""
+	e.tag = "v1.1.0" // una release nuova, senza più la firma
+	e.app.controlla(context.Background(), e.voce(id))
+	if v := e.aggiorna(id, false); v.EsitoUpdate.OK || v.Installato.Tag != "v1.0.0" || !strings.Contains(v.EsitoUpdate.Messaggio, "non è firmata") {
+		t.Errorf("firma tolta dopo averla vista: %+v installato %s", v.EsitoUpdate, v.Installato.Tag)
+	}
+}
+
+// Una release più vecchia presentata come ultima non fa scendere di versione.
+func TestNonSiScendeDiVersione(t *testing.T) {
+	e := nuovoAmbiente(t)
+	e.tag = "v1.1.0"
+	e.altre = []string{"v1.0.0"}
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente})
+	if v = e.aggiorna(v.ID, false); !v.EsitoUpdate.OK || v.Installato.Tag != "v1.1.0" {
+		t.Fatalf("prima installazione: %+v", v.EsitoUpdate)
+	}
+	e.tag = "v1.0.0" // GitHub «ultima» ora è più vecchia: ripubblicata a mano o attacco
+	e.app.controlla(context.Background(), e.voce(v.ID))
+	if v = e.aggiorna(v.ID, false); v.EsitoUpdate.OK || v.Installato.Tag != "v1.1.0" || !strings.Contains(v.EsitoUpdate.Messaggio, "più vecchia") {
+		t.Errorf("discesa di versione di nascosto: %+v installato %s", v.EsitoUpdate, v.Installato.Tag)
+	}
+	// scelta dall'utente, si può
+	if v = e.installa(v.ID, Opzioni{Tag: "v1.0.0"}); !v.EsitoUpdate.OK || v.Installato.Tag != "v1.0.0" {
+		t.Errorf("scelta esplicita di una versione più vecchia: %+v", v.EsitoUpdate)
+	}
+}
+
+func TestPretendiFirmaFirmaSenzaSomme(t *testing.T) {
+	e := nuovoAmbiente(t)
+	e.firma = "valida"
+	e.app.nuovoCli = func(token string) *github.Client { return e.cliente(token) }
+	chiaviFidate = func() []ed25519.PublicKey { return nil } // nessuna chiave incorporata
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente})
+	e.app.SalvaRepo(config.Repo{ID: v.ID, Nome: "Prova", Repo: "a/Prova", PretendiFirma: true, Locale: config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente}})
+	if v = e.aggiorna(v.ID, false); v.EsitoUpdate.OK || !strings.Contains(v.EsitoUpdate.Messaggio, "nessuna chiave pubblica incorporata") {
+		t.Errorf("senza chiavi fidate non si può verificare: %+v", v.EsitoUpdate)
+	}
+}
+
+func TestPretendiFirmaArchivioEDaArchivio(t *testing.T) {
+	e := nuovoAmbiente(t)
+	e.firma = "valida"
+	master := filepath.Join(e.base, "master")
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente, CartellaArchivio: master})
+	e.app.SalvaRepo(config.Repo{ID: v.ID, Nome: "Prova", Repo: "a/Prova", PretendiFirma: true,
+		Locale: config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente, CartellaArchivio: master}})
+	if v = e.archivia(v.ID); !v.EsitoArchivio.OK {
+		t.Fatalf("archiviazione firmata: %+v", v.EsitoArchivio)
+	}
+	for _, f := range []string{"SHA256SUMS.txt", "SHA256SUMS.txt.sig"} {
+		if _, err := os.Stat(filepath.Join(master, "v1.0.0", f)); err != nil {
+			t.Errorf("manca %s nell'archivio", f)
+		}
+	}
+	// senza rete: la firma si controlla sui file archiviati
+	e.srv.Close()
+	if v = e.installa(v.ID, Opzioni{Da: "archivio", Tag: "v1.0.0"}); !v.EsitoUpdate.OK || v.Installato.Tag != "v1.0.0" {
+		t.Fatalf("installazione firmata dall'archivio: %+v", v.EsitoUpdate)
+	}
+	// somme alterate nell'archivio: la firma non torna più
+	if err := e.app.Disinstalla(v.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	e.attendi()
+	if err := os.WriteFile(filepath.Join(master, "v1.0.0", "SHA256SUMS.txt"), []byte(strings.Repeat("0", 64)+"  "+e.nomeFile+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v = e.installa(v.ID, Opzioni{Da: "archivio", Tag: "v1.0.0"})
+	if v.EsitoUpdate.OK || !strings.Contains(v.EsitoUpdate.Messaggio, "nessuna chiave fidata") {
+		t.Errorf("archivio con somme alterate: %+v", v.EsitoUpdate)
+	}
+}
+
+func TestIntegritaDopoInstallazione(t *testing.T) {
+	e := nuovoAmbiente(t)
+	v := e.aggiungi(config.Locale{Aggiorna: true, Ambito: config.AmbitoUtente})
+	v = e.aggiorna(v.ID, false)
+	if !v.EsitoUpdate.OK || v.Integrita != "ok" {
+		t.Fatalf("appena installato deve risultare integro: %+v %q", v.EsitoUpdate, v.Integrita)
+	}
+	// nuova sessione: all'apertura si ricontrolla
+	e.nuovaSessione()
+	if got := e.vista(v.ID); got.Integrita != "" {
+		t.Errorf("prima della verifica non si sa: %q", got.Integrita)
+	}
+	e.app.VerificaIntegrita()
+	attendiIntegrita(t, e, v.ID, "ok")
+	// il file installato viene alterato
+	if err := os.WriteFile(v.Installato.Percorso, []byte("alterato"), 0o755); err != nil {
+		// su macOS e Windows il programma è una cartella
+		var primo string
+		filepath.WalkDir(v.Installato.Percorso, func(p string, d os.DirEntry, _ error) error {
+			if primo == "" && d != nil && d.Type().IsRegular() {
+				primo = p
+			}
+			return nil
+		})
+		if primo == "" {
+			t.Fatal("niente da alterare in", v.Installato.Percorso)
+		}
+		os.WriteFile(primo, []byte("alterato"), 0o755)
+	}
+	e.nuovaSessione()
+	e.app.VerificaIntegrita()
+	attendiIntegrita(t, e, v.ID, "diversa")
+	if got := e.vista(v.ID); len(got.IntegritaFile) == 0 {
+		t.Error("deve dire quale file è diverso")
+	}
+	// disinstallato: il manifesto sparisce
+	if err := e.app.Disinstalla(v.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	e.attendi()
+	e.nuovaSessione()
+	e.app.VerificaIntegrita()
+	time.Sleep(100 * time.Millisecond)
+	if got := e.vista(v.ID); got.Integrita != "" {
+		t.Errorf("dopo la disinstallazione: %q", got.Integrita)
+	}
+}
+
+func attendiIntegrita(t *testing.T, e *ambiente, id, atteso string) {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		if e.vista(id).Integrita == atteso {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("integrità attesa %q, vista %q", atteso, e.vista(id).Integrita)
 }

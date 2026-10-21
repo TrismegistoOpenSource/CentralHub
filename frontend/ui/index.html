@@ -68,6 +68,8 @@
           </button>
         </div>
         <div class="toolbar-right">
+          <input type="text" id="cerca" class="cerca" placeholder="Cerca…" spellcheck="false" autocomplete="off" title="Filtra per nome, repository o tag" />
+          <button class="chip" id="filtro-agg" title="Mostra solo i repository con una release più nuova di quella installata o archiviata">Da aggiornare</button>
           <div class="tag-chips" id="tag-chips"></div>
           <button class="btn ghost" id="btn-controlla" title="Chiede di nuovo a GitHub l'ultima release di ogni repository">Controlla</button>
           <button class="btn" id="btn-aggiungi">
@@ -121,6 +123,10 @@
       <label class="switch-row">
         <span>Repository privato <em>(serve una chiave di accesso)</em></span>
         <input type="checkbox" id="repo-privato" /><i></i>
+      </label>
+      <label class="switch-row">
+        <span>Rifiuta le release non firmate <em>(la firma si controlla sempre; qui si pretende anche che ci sia. Si accende da sola appena CentralHub vede una release firmata di questo repository)</em></span>
+        <input type="checkbox" id="repo-firma" /><i></i>
       </label>
       <div class="field" id="repo-campo-chiave" hidden>
         <span class="field-label">Chiave di accesso <em>(token GitHub in sola lettura, meglio uno solo per questo repository)</em></span>
@@ -195,6 +201,13 @@
     <div class="modal confirm-modal">
       <h2 id="inst-titolo"></h2>
       <p class="nota" id="inst-avviso" hidden></p>
+      <div class="field" id="inst-campo-da" hidden>
+        <span class="field-label">Da dove installare</span>
+        <div class="scelta" id="inst-da">
+          <button data-da="github"><strong>Da GitHub</strong><span>l'ultima release o quella che scegli</span></button>
+          <button data-da="archivio"><strong>Dall'archivio</strong><span>dalla cartella d'archivio, senza rete</span></button>
+        </div>
+      </div>
       <label class="field">
         <span>Versione <em id="inst-versioni-nota"></em></span>
         <select id="inst-versione"></select>
@@ -213,6 +226,17 @@
       <div class="modal-actions">
         <button class="btn ghost" id="inst-annulla">Annulla</button>
         <button class="btn primary" id="inst-ok">Installa</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- novità della release -->
+  <div class="modal-overlay" id="dlg-novita" hidden>
+    <div class="modal confirm-modal">
+      <h2 id="nov-titolo"></h2>
+      <pre class="novita-testo" id="nov-testo"></pre>
+      <div class="modal-actions">
+        <button class="btn primary" id="nov-chiudi">Chiudi</button>
       </div>
     </div>
   </div>

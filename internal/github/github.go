@@ -6,7 +6,9 @@
 package github
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,6 +113,8 @@ type Release struct {
 	Assets     []Asset `json:"assets"`
 	Tarball    string  `json:"tarball_url"`
 	Zipball    string  `json:"zipball_url"`
+	// Note è il testo della release (Markdown), com'è su GitHub.
+	Note string `json:"body"`
 	// Bozza e Prerelease: una bozza non è pubblicata; una prerelease sì, ma
 	// non è mai "l'ultima".
 	Bozza      bool `json:"draft"`
@@ -127,9 +131,18 @@ type Errore struct {
 func (e *Errore) Error() string { return e.Messaggio }
 
 func (c *Client) richiesta(ctx context.Context, indirizzo, accept string) (*http.Response, error) {
+	return c.richiestaDa(ctx, indirizzo, accept, 0)
+}
+
+// richiestaDa è richiesta con, se da > 0, la richiesta del file a partire da
+// quel byte (Range). L'intestazione segue i redirect verso lo storage.
+func (c *Client) richiestaDa(ctx context.Context, indirizzo, accept string, da int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, indirizzo, nil)
 	if err != nil {
 		return nil, err
+	}
+	if da > 0 {
+		req.Header.Set("Range", "bytes="+strconv.FormatInt(da, 10)+"-")
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -300,4 +313,298 @@ func SorgentiWeb(web, repo, tag string) (zip, tar string) {
 	}
 	base := web + "/" + repo + "/archive/refs/tags/" + strings.Join(parti, "/")
 	return base + ".zip", base + ".tar.gz"
+}
+
+// TagPubblico dice qual è l'ultima release di un repository chiedendolo al
+// sito e non all'API: GET github.com/<repo>/releases/latest risponde con un
+// redirect a .../releases/tag/<tag>, e quella richiesta non consuma il
+// limite di 60 richieste all'ora dell'API. Vale solo per i repository
+// pubblici senza token (Web() non vuoto); con un errore qualunque chi
+// chiama ripiega sull'API, che dà anche il messaggio giusto.
+//
+// "Ultima" è la stessa di GitHub: bozze e prerelease escluse.
+func (c *Client) TagPubblico(ctx context.Context, repo string) (string, error) {
+	web := c.Web()
+	if web == "" {
+		return "", errors.New("senza il sito pubblico non si può chiedere il tag")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, web+"/"+repo+"/releases/latest", nil)
+	if err != nil {
+		return "", err
+	}
+	if c.UserAgent != "" {
+		req.Header.Set("User-Agent", c.UserAgent)
+	}
+	senzaRedirect := *c.HTTP
+	senzaRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := senzaRedirect.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", &Errore{"rete", "GitHub non è raggiungibile: rete assente, bloccata o troppo lenta (" + causa(err) + ")"}
+	}
+	defer resp.Body.Close()
+	return tagDaRedirect(resp.StatusCode, resp.Header.Get("Location"))
+}
+
+// tagDaRedirect legge il tag dall'indirizzo a cui GitHub rimanda
+// /releases/latest. Senza release rimanda a /releases (o risponde 404).
+func tagDaRedirect(stato int, dove string) (string, error) {
+	if stato < 300 || stato > 399 || dove == "" {
+		return "", &Errore{"nessuna-release", "il sito non indica nessuna release"}
+	}
+	u, err := url.Parse(dove)
+	if err != nil {
+		return "", err
+	}
+	const segno = "/releases/tag/"
+	i := strings.LastIndex(u.EscapedPath(), segno)
+	if i < 0 {
+		return "", &Errore{"nessuna-release", "il sito non indica nessuna release"}
+	}
+	tag, err := url.PathUnescape(u.EscapedPath()[i+len(segno):])
+	if err != nil || tag == "" || strings.ContainsAny(tag, "\r\n") {
+		return "", &Errore{"server", "il sito ha indicato un tag illeggibile"}
+	}
+	return tag, nil
+}
+
+// ePerSomme dice se un asset è il file con le somme SHA-256 della release.
+func ePerSomme(nome string) bool {
+	n := strings.ToLower(nome)
+	return n == "sha256sums.txt" || n == "sha256sums"
+}
+
+// FileSomme restituisce l'asset con le somme di controllo della release
+// (SHA256SUMS.txt), se c'è.
+func (r *Release) FileSomme() (Asset, bool) {
+	for _, a := range r.Assets {
+		if ePerSomme(a.Nome) {
+			return a, true
+		}
+	}
+	return Asset{}, false
+}
+
+// maxSomme: il file delle somme è di poche righe.
+const maxSomme = 1 << 20
+
+// AnalizzaSomme legge l'uscita di sha256sum (`<sha256>  <nome>` o
+// `<sha256> *<nome>`, un file per riga): nome -> somma in minuscolo. Le righe
+// che non sembrano una somma si ignorano.
+func AnalizzaSomme(testo string) map[string]string {
+	m := map[string]string{}
+	sc := bufio.NewScanner(strings.NewReader(testo))
+	for sc.Scan() {
+		riga := strings.TrimSpace(sc.Text())
+		if len(riga) < 66 {
+			continue
+		}
+		somma := strings.ToLower(riga[:64])
+		if b, err := hex.DecodeString(somma); err != nil || len(b) != 32 {
+			continue
+		}
+		nome := strings.TrimSpace(riga[64:])
+		nome = strings.TrimPrefix(nome, "*")
+		nome = strings.TrimPrefix(nome, "./")
+		if nome == "" || strings.ContainsAny(nome, "/\\") {
+			continue
+		}
+		m[nome] = somma
+	}
+	return m
+}
+
+// FileFirma restituisce l'asset con la firma di SHA256SUMS.txt
+// (SHA256SUMS.txt.sig), se c'è.
+func (r *Release) FileFirma() (Asset, bool) {
+	for _, a := range r.Assets {
+		if strings.EqualFold(a.Nome, "SHA256SUMS.txt.sig") {
+			return a, true
+		}
+	}
+	return Asset{}, false
+}
+
+// piccolo scarica un asset di poche righe (somme, firma).
+func (c *Client) piccolo(ctx context.Context, repo string, a Asset) ([]byte, error) {
+	var corpo io.ReadCloser
+	var err error
+	if c.Web() != "" && a.Pubblico != "" {
+		corpo, _, err = c.ApriWeb(ctx, a.Pubblico)
+	} else {
+		corpo, _, err = c.Apri(ctx, a.URL, repo, true)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer corpo.Close()
+	b, err := io.ReadAll(io.LimitReader(corpo, maxSomme+1))
+	if err != nil {
+		return nil, &Errore{"rete", "il file " + a.Nome + " non si è letto per intero: " + err.Error()}
+	}
+	if len(b) > maxSomme {
+		return nil, &Errore{"server", "il file " + a.Nome + " è troppo grande"}
+	}
+	return b, nil
+}
+
+// Somme legge il file SHA256SUMS.txt di una release. Restituisce nil, nil se
+// la release non lo pubblica; un errore se lo pubblica e non si riesce a
+// leggerlo (una rete che balbetta non deve far saltare il controllo).
+func (c *Client) Somme(ctx context.Context, repo string, r *Release) (map[string]string, error) {
+	somme, _, err := c.SommeEFirma(ctx, repo, r)
+	return somme, err
+}
+
+// SommeEFirma legge anche il testo grezzo di SHA256SUMS.txt e la firma
+// (SHA256SUMS.txt.sig, "" se la release non la pubblica): la firma si
+// verifica sul testo grezzo, byte per byte.
+func (c *Client) SommeEFirma(ctx context.Context, repo string, r *Release) (somme map[string]string, grezzo []byte, err error) {
+	a, ok := r.FileSomme()
+	if !ok {
+		return nil, nil, nil
+	}
+	if grezzo, err = c.piccolo(ctx, repo, a); err != nil {
+		return nil, nil, err
+	}
+	return AnalizzaSomme(string(grezzo)), grezzo, nil
+}
+
+// Firma legge la firma di SHA256SUMS.txt: "" se la release non ne ha una.
+func (c *Client) Firma(ctx context.Context, repo string, r *Release) (string, error) {
+	a, ok := r.FileFirma()
+	if !ok {
+		return "", nil
+	}
+	b, err := c.piccolo(ctx, repo, a)
+	return strings.TrimSpace(string(b)), err
+}
+
+// ConSomme restituisce una copia della release in cui gli asset senza digest
+// ricevono la somma dal file delle somme. Il digest di GitHub, se c'è, resta.
+func (r *Release) ConSomme(somme map[string]string) *Release {
+	copia := *r
+	copia.Assets = append([]Asset(nil), r.Assets...)
+	for i, a := range copia.Assets {
+		if a.Digest == "" {
+			if s, ok := somme[a.Nome]; ok {
+				copia.Assets[i].Digest = "sha256:" + s
+			}
+		}
+	}
+	return &copia
+}
+
+// Pezzo è un file aperto dal byte Inizio: Inizio è quello chiesto, oppure 0 se
+// il server ha mandato il file intero (non sa riprendere a metà).
+type Pezzo struct {
+	Corpo  io.ReadCloser
+	Inizio int64
+	// Totale è la lunghezza dell'intero file, -1 se ignota.
+	Totale int64
+}
+
+// ApriDa apre un asset (sull'API se web è falso, altrimenti un indirizzo del
+// sito pubblico) a partire dal byte da. Serve a riprendere un download
+// interrotto invece di ricominciarlo.
+func (c *Client) ApriDa(ctx context.Context, indirizzo, repo string, web bool, da int64) (*Pezzo, error) {
+	var resp *http.Response
+	var err error
+	if web {
+		req, e := http.NewRequestWithContext(ctx, http.MethodGet, indirizzo, nil)
+		if e != nil {
+			return nil, e
+		}
+		if c.UserAgent != "" {
+			req.Header.Set("User-Agent", c.UserAgent)
+		}
+		if da > 0 {
+			req.Header.Set("Range", "bytes="+strconv.FormatInt(da, 10)+"-")
+		}
+		if resp, err = c.HTTP.Do(req); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, &Errore{"rete", "GitHub non è raggiungibile: rete assente, bloccata o troppo lenta (" + causa(err) + ")"}
+		}
+	} else if resp, err = c.richiestaDa(ctx, indirizzo, "application/octet-stream", da); err != nil {
+		return nil, err
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return &Pezzo{Corpo: resp.Body, Inizio: 0, Totale: resp.ContentLength}, nil
+	case http.StatusPartialContent:
+		inizio, totale, ok := leggiContentRange(resp.Header.Get("Content-Range"))
+		if !ok || inizio != da {
+			resp.Body.Close()
+			return nil, &Errore{"server", "il server ha risposto a metà file con un intervallo diverso da quello chiesto"}
+		}
+		return &Pezzo{Corpo: resp.Body, Inizio: inizio, Totale: totale}, nil
+	case http.StatusRequestedRangeNotSatisfiable:
+		resp.Body.Close()
+		return nil, &Errore{"intervallo", "il file parziale è più grande di quello pubblicato"}
+	}
+	defer resp.Body.Close()
+	if web {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			return nil, &Errore{"server", "il file non c'è più su GitHub (la release è stata modificata?)"}
+		case http.StatusTooManyRequests:
+			return nil, &Errore{"limite", "GitHub chiede di rallentare i download: riprova fra qualche minuto"}
+		}
+		return nil, &Errore{"server", fmt.Sprintf("GitHub ha risposto con l'errore %d", resp.StatusCode)}
+	}
+	return nil, c.spiega(resp, repo)
+}
+
+// leggiContentRange legge "bytes 100-199/1000" → (100, 1000); il totale è -1
+// se il server scrive "*".
+func leggiContentRange(v string) (inizio, totale int64, ok bool) {
+	v = strings.TrimSpace(v)
+	v, si := strings.CutPrefix(v, "bytes ")
+	if !si {
+		return 0, 0, false
+	}
+	span, tot, si := strings.Cut(v, "/")
+	if !si {
+		return 0, 0, false
+	}
+	da, _, si := strings.Cut(span, "-")
+	if !si {
+		return 0, 0, false
+	}
+	inizio, err := strconv.ParseInt(strings.TrimSpace(da), 10, 64)
+	if err != nil || inizio < 0 {
+		return 0, 0, false
+	}
+	totale = -1
+	if tot = strings.TrimSpace(tot); tot != "*" {
+		if totale, err = strconv.ParseInt(tot, 10, 64); err != nil {
+			return 0, 0, false
+		}
+	}
+	return inizio, totale, true
+}
+
+// ApplicaFirmate restituisce una copia della release in cui ogni asset
+// elencato nelle somme (già verificate con la firma) ha quella somma come
+// digest. Se GitHub dava un digest diverso per lo stesso file la release è
+// incoerente: errore.
+func (r *Release) ApplicaFirmate(somme map[string]string) (*Release, error) {
+	copia := *r
+	copia.Assets = append([]Asset(nil), r.Assets...)
+	for i, a := range copia.Assets {
+		s, ok := somme[a.Nome]
+		if !ok {
+			continue
+		}
+		if a.Digest != "" && !strings.EqualFold(a.Digest, "sha256:"+s) {
+			return nil, fmt.Errorf("per %s il digest di GitHub non coincide con la somma firmata: la release è stata alterata", a.Nome)
+		}
+		copia.Assets[i].Digest = "sha256:" + s
+	}
+	return &copia, nil
 }

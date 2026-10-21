@@ -399,6 +399,7 @@ input[type="text"]:focus, input[type="password"]:focus {
 .card-versioni { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--text-dim); }
 .card-versioni b { color: var(--text); font-weight: 600; font-family: var(--mono); font-size: 11.5px; }
 .card-versioni .nuova b { color: var(--accent-a); }
+.card-versioni .diversa b { color: var(--danger); }
 
 .card-esito { font-size: 12px; color: var(--text-dim); user-select: text; overflow-wrap: anywhere; }
 .card-esito.errore { color: var(--danger); }
@@ -444,3 +445,18 @@ select:disabled { opacity: 0.75; }
 .scelta button:disabled { cursor: default; }
 .confirm-body .switch-row { margin-top: 10px; color: var(--text); }
 .confirm-body ul { margin: 6px 0 0 18px; }
+
+/* ricerca e filtro della lista */
+.cerca { width: 150px !important; padding: 6px 10px !important; font-size: 12.5px; }
+.novita-testo {
+  margin: 0; max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: 12px/1.55 var(--mono); color: var(--text-dim); user-select: text;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+}
+.card-actions .riga { flex-wrap: wrap; }
+
+/* con poco spazio (per esempio il Registro aperto) la scheda va a capo: i
+   pulsanti scendono sotto il testo invece di schiacciarlo a una lettera per riga */
+.card { flex-wrap: wrap; }
+.card-body { flex: 1 1 280px; min-width: 240px; }
+.card-actions { margin-left: auto; }

@@ -20,6 +20,7 @@ import (
 	"centralhub/internal/config"
 	"centralhub/internal/github"
 	"centralhub/internal/installa"
+	"centralhub/internal/integrita"
 	"centralhub/internal/scarica"
 )
 
@@ -39,10 +40,12 @@ type App struct {
 	esiti    map[string]config.Esito
 	cartelle installa.Cartelle
 	lavori   map[string]*lavoro         // per ID
-	ultime   map[string]*github.Release // ultima release vista in questa sessione
-	visteIl  map[string]time.Time       // quando
+	ultime   map[string]*github.Release // ultima release vista (si ricorda anche fra una sessione e l'altra: ultime.json)
+	visteIl  map[string]time.Time       // quando l'ultimo controllo è andato a buon fine
+	prese    map[string]time.Time       // quando l'elenco dei pacchetti è stato chiesto all'API
 	errori   map[string]string          // errore dell'ultimo controllo
 	elenchi  map[string]elenco          // le release fra cui scegliere, viste da poco
+	integri  map[string]integrita.Esito // com'è ogni programma installato rispetto alle somme annotate
 	// basiDati: dove si cercano le impostazioni di un programma da disinstallare
 	basiDati []string
 
@@ -85,8 +88,10 @@ func NuovaApp() *App {
 		lavori:  map[string]*lavoro{},
 		ultime:  map[string]*github.Release{},
 		visteIl: map[string]time.Time{},
+		prese:   map[string]time.Time{},
 		errori:  map[string]string{},
 		elenchi: map[string]elenco{},
+		integri: map[string]integrita.Esito{},
 		nuovoCli: func(token string) *github.Client {
 			c := github.Nuovo(token, "CentralHub/"+Versione)
 			if _, isolata, _ := config.Cartella(); isolata {
@@ -121,7 +126,9 @@ func (a *App) carica() {
 	a.mu.Lock()
 	a.cfg, a.cartelle, a.basiDati = cfg, cartelle, basiDati
 	a.esiti = config.CaricaEsiti()
+	delete(a.esiti, "@controllo") // della 0.2.1: il controllo ora è gratis per i pubblici
 	a.ritrovaEsitiVecchi()
+	a.caricaUltime()
 	a.mu.Unlock()
 	if err != nil {
 		a.log("Configurazione non letta: " + err.Error())
@@ -172,6 +179,7 @@ func (a *App) log(riga string) {
 type voce struct {
 	ID, Nome, Repo, Asset string
 	Privato               bool
+	PretendiFirma         bool
 	config.Locale
 	token string
 }
@@ -237,7 +245,7 @@ func (a *App) ritrovaEsitiVecchi() {
 func (a *App) voci() []voce {
 	var out []voce
 	for _, r := range a.cfg.Repo {
-		out = append(out, voce{ID: r.ID, Nome: r.Nome, Repo: r.Repo, Asset: r.Asset, Privato: r.Privato, Locale: r.Locale, token: r.Token})
+		out = append(out, voce{ID: r.ID, Nome: r.Nome, Repo: r.Repo, Asset: r.Asset, Privato: r.Privato, PretendiFirma: r.PretendiFirma, Locale: r.Locale, token: r.Token})
 	}
 	return out
 }
@@ -260,7 +268,11 @@ type Vista struct {
 	// Privato: il repository richiede una chiave. ConChiave: ce l'ha.
 	// MancaChiave: è privato e la chiave non c'è. La chiave stessa non arriva
 	// mai all'interfaccia.
-	Privato          bool   `json:"privato"`
+	Privato       bool `json:"privato"`
+	PretendiFirma bool `json:"pretendiFirma"`
+	// FirmaRichiesta: per questo repository una release non firmata si
+	// rifiuta (interruttore acceso, o proprietario che firma).
+	FirmaRichiesta   bool   `json:"firmaRichiesta"`
 	ConChiave        bool   `json:"conChiave"`
 	MancaChiave      bool   `json:"manca"`
 	Tag              string `json:"tag"`
@@ -270,7 +282,14 @@ type Vista struct {
 
 	UltimaRelease string `json:"ultimaRelease"` // "" = non ancora controllata
 	NomeRelease   string `json:"nomeRelease"`
-	Errore        string `json:"errore"`
+	// Integrita: "" = non verificata, "ok" = i file sono quelli annotati
+	// all'installazione, "diversa" = qualcuno è cambiato o sparito (i primi
+	// nomi in IntegritaFile).
+	Integrita     string   `json:"integrita"`
+	IntegritaFile []string `json:"integritaFile"`
+	HaNote        bool     `json:"haNote"`  // la release ha un testo da mostrare
+	VistaIl       string   `json:"vistaIl"` // quando è stata controllata (RFC 3339)
+	Errore        string   `json:"errore"`
 
 	// Archiviazione
 	Archiviata string `json:"archiviata"` // la più recente nella cartella master
@@ -315,7 +334,7 @@ func stessaVersione(tag, versione string) bool {
 // vista va chiamata con il lucchetto preso.
 func (a *App) vista(v voce) Vista {
 	reg, _ := a.cartellaRegistro()
-	o := Vista{ID: v.ID, Nome: v.Nome, Repo: v.Repo, Asset: v.Asset, Privato: v.Privato, ConChiave: v.token != "", MancaChiave: v.senzaChiave(),
+	o := Vista{ID: v.ID, Nome: v.Nome, Repo: v.Repo, Asset: v.Asset, Privato: v.Privato, PretendiFirma: v.PretendiFirma, FirmaRichiesta: v.PretendiFirma || proprietarioFirmato(v.Repo), ConChiave: v.token != "", MancaChiave: v.senzaChiave(),
 		Tag: v.Tag, CartellaArchivio: v.CartellaArchivio, Aggiorna: v.Aggiorna, Ambito: v.Ambito, Errore: a.errori[v.ID]}
 	if v.CartellaArchivio != "" {
 		if s := scarica.Scaricate(v.CartellaArchivio); len(s) > 0 {
@@ -323,6 +342,16 @@ func (a *App) vista(v voce) Vista {
 		}
 	}
 	o.Installato = installa.LeggiStato(reg, v.Nome, runtime.GOOS, a.cartelle)
+	if i, ok := a.integri[v.ID]; ok && o.Installato.Presente {
+		o.Integrita = "ok"
+		if !i.Integro() {
+			o.Integrita = "diversa"
+			o.IntegritaFile = append(append([]string{}, i.Diversi...), i.Mancano...)
+			if len(o.IntegritaFile) > 8 {
+				o.IntegritaFile = o.IntegritaFile[:8]
+			}
+		}
+	}
 	if e, ok := a.esiti[v.ID+"|"+modoArchivio]; ok {
 		o.EsitoArchivio = &e
 	}
@@ -331,6 +360,10 @@ func (a *App) vista(v voce) Vista {
 	}
 	if r := a.ultime[v.ID]; r != nil {
 		o.UltimaRelease, o.NomeRelease = r.Tag, r.Nome
+		o.HaNote = strings.TrimSpace(r.Note) != ""
+		if q := a.visteIl[v.ID]; !q.IsZero() {
+			o.VistaIl = q.Format(time.RFC3339)
+		}
 		if v.CartellaArchivio != "" {
 			o.ArchivioAggiornato = "no"
 			if scarica.Presente(v.CartellaArchivio, r.Tag) {
@@ -644,6 +677,7 @@ func completa(r config.Repo, f config.Repo) config.Repo {
 		r.Asset = f.Asset
 	}
 	r.Privato = r.Privato || f.Privato
+	r.PretendiFirma = r.PretendiFirma || f.PretendiFirma
 	if f.Token != "" {
 		r.Token = f.Token
 	}
@@ -757,11 +791,49 @@ func (a *App) Annulla(id string) {
 	a.mu.Unlock()
 }
 
-// controlla chiede a GitHub l'ultima release e la ricorda. Ogni repository
-// usa la propria chiave, se ne ha una; un privato senza chiave si prova lo
+// validitaElenco: per quanto tempo, fra un cambio di tag e l'altro, ci si
+// fida dell'elenco dei pacchetti già chiesto all'API. Il tag lo dice il sito
+// gratis a ogni controllo; l'elenco (con i digest) si richiede se il tag
+// cambia o se è più vecchio di così, perché i file di una release possono
+// essere ricaricati senza cambiare il tag.
+const validitaElenco = 24 * time.Hour
+
+// scorciatoia: un controllo fatto da meno di così si riusa nel lavoro che
+// segue (la finestra di scelta e poi l'installazione), invece di rifarlo.
+const scorciatoia = 30 * time.Second
+
+// gratis dice se il controllo di questo repository non consuma richieste
+// dell'API: sì per un pubblico senza chiave, il cui ultimo tag si legge dal
+// sito. Un privato senza chiave si prova anonimo e dà un 404: costa.
+func (a *App) gratis(v voce) bool {
+	return !v.senzaChiave() && a.nuovoCli(v.token).Web() != ""
+}
+
+// controlla guarda qual è l'ultima release di un repository e la ricorda.
+// Per un pubblico senza chiave chiede prima il tag al sito (gratis): se è
+// quello già noto e l'elenco dei pacchetti è recente, non chiede altro. Negli
+// altri casi, o se il sito non risponde, chiede l'ultima release all'API: ogni
+// repository usa la propria chiave; un privato senza chiave si prova lo
 // stesso, anonimo (se è diventato pubblico funziona).
 func (a *App) controlla(ctx context.Context, v voce) (*github.Release, error) {
-	r, err := a.nuovoCli(v.token).Ultima(ctx, v.Repo)
+	cli := a.nuovoCli(v.token)
+	if cli.Web() != "" && !v.senzaChiave() {
+		if tag, err := cli.TagPubblico(ctx, v.Repo); err == nil {
+			a.mu.Lock()
+			noto, preso := a.ultime[v.ID], a.prese[v.ID]
+			if noto != nil && noto.Tag == tag && time.Since(preso) < validitaElenco {
+				a.visteIl[v.ID] = time.Now()
+				delete(a.errori, v.ID)
+				a.salvaUltime()
+				a.mu.Unlock()
+				return noto, nil
+			}
+			a.mu.Unlock()
+		} else if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	r, err := cli.Ultima(ctx, v.Repo)
 	if siSpiegaConLaChiave(v, err) {
 		err = errMancaChiave
 	}
@@ -774,23 +846,27 @@ func (a *App) controlla(ctx context.Context, v voce) (*github.Release, error) {
 			a.errori[v.ID] = err.Error()
 		}
 	} else {
+		if len(r.Note) > maxNote {
+			r.Note = r.Note[:maxNote]
+		}
 		a.ultime[v.ID] = r
 		a.visteIl[v.ID] = time.Now()
+		a.prese[v.ID] = time.Now()
 		delete(a.errori, v.ID)
+		a.salvaUltime()
 	}
 	a.mu.Unlock()
 	return r, err
 }
 
-// ultima restituisce l'ultima release per un lavoro: quella appena vista, se
-// il controllo è di meno di due minuti fa, altrimenti la richiede. Evita di
-// interrogare GitHub due volte di fila (all'apertura e subito dopo al primo
-// clic): per i repository pubblici le richieste sono contate, 60 all'ora.
+// ultima restituisce l'ultima release per un lavoro (installare, aggiornare,
+// archiviare): prima controlla quel repository, e solo se l'ha già fatto da
+// meno di mezzo minuto (la finestra di scelta e poi il clic) riusa l'esito.
 func (a *App) ultima(ctx context.Context, v voce) (*github.Release, error) {
 	a.mu.Lock()
 	r, quando := a.ultime[v.ID], a.visteIl[v.ID]
 	a.mu.Unlock()
-	if r != nil && time.Since(quando) < 2*time.Minute {
+	if r != nil && time.Since(quando) < scorciatoia {
 		return r, nil
 	}
 	return a.controlla(ctx, v)
@@ -817,45 +893,40 @@ func (a *App) Controlla(id string) {
 	}()
 }
 
-// chiaveControllo è dove, in stato.json, sta l'istante dell'ultimo controllo
-// di tutti i repository (non è un esito di lavoro: ha la stessa forma per
-// comodità, e nessun ID di repository può essere uguale).
-const chiaveControllo = "@controllo"
-
-// intervalloApertura: all'apertura si controlla solo se l'ultimo controllo
-// è più vecchio di così. GitHub concede 60 richieste all'ora per computer ai
-// repository senza chiave, una per repository a ogni controllo.
+// intervalloApertura: all'apertura i repository che per essere controllati
+// consumano richieste dell'API (quelli con una chiave, o che il sito non sa
+// dire) si controllano solo se l'ultimo controllo è più vecchio di così. I
+// pubblici si controllano sempre: il sito non conta.
 const intervalloApertura = time.Hour
 
-// ControllaAllApertura è il controllo che si fa aprendo l'app: parte solo se
-// l'ultimo controllo (di una sessione precedente o di questa) risale a più di
-// un'ora fa. Restituisce se è partito. «Controlla» chiama invece
-// ControllaTutti, che controlla sempre.
+// ControllaAllApertura è il controllo che si fa aprendo l'app. Restituisce
+// se è partito qualcosa. «Controlla» chiama invece ControllaTutti, che
+// controlla tutto sempre.
 func (a *App) ControllaAllApertura() bool {
 	a.mu.Lock()
-	e, ok := a.esiti[chiaveControllo]
-	a.mu.Unlock()
-	if ok {
-		if t, err := time.Parse(time.RFC3339, e.Quando); err == nil {
-			// un orologio spostato indietro non deve bloccare i controlli
-			if d := time.Since(t); d >= 0 && d < intervalloApertura {
-				return false
-			}
+	var scelti []voce
+	for _, v := range a.voci() {
+		if a.gratis(v) {
+			scelti = append(scelti, v)
+			continue
+		}
+		// un orologio spostato indietro non deve bloccare i controlli
+		if d := time.Since(a.visteIl[v.ID]); a.visteIl[v.ID].IsZero() || d < 0 || d >= intervalloApertura {
+			scelti = append(scelti, v)
 		}
 	}
-	a.ControllaTutti()
-	return true
+	a.mu.Unlock()
+	for _, v := range scelti {
+		a.Controlla(v.ID)
+	}
+	return len(scelti) > 0
 }
 
 // ControllaTutti lo fa per tutti i repository, senza guardare quando è stato
-// fatto l'ultima volta, e ne ricorda l'istante.
+// fatto l'ultima volta.
 func (a *App) ControllaTutti() {
 	a.mu.Lock()
 	voci := a.voci()
-	if len(voci) > 0 {
-		a.esiti[chiaveControllo] = config.Esito{OK: true, Quando: time.Now().Format(time.RFC3339)}
-		_ = config.SalvaEsiti(a.esiti)
-	}
 	a.mu.Unlock()
 	for _, v := range voci {
 		a.Controlla(v.ID)
@@ -933,6 +1004,15 @@ func (a *App) tutti(modo string, scelti func(Vista) bool, lavoro func(ctx contex
 }
 
 func (a *App) fallito(ctx context.Context, v voce, modo, tag string, err error) {
+	// l'errore di questo lavoro è più preciso di quello, vecchio, di un
+	// controllo (per esempio «GitHub non raggiungibile» prima di
+	// un'installazione dall'archivio che poi non torna): la scheda mostra
+	// il primo; il secondo ricompare al prossimo controllo, se c'è ancora
+	a.mu.Lock()
+	if a.errori[v.ID] != err.Error() {
+		delete(a.errori, v.ID)
+	}
+	a.mu.Unlock()
 	if ctx.Err() != nil {
 		a.log(v.Nome + ": interrotto")
 		a.annota(v.ID, modo, false, tag, "Interrotto")
@@ -966,6 +1046,24 @@ func (a *App) archivia(ctx context.Context, v voce) {
 		a.fallito(ctx, v, modoArchivio, "", err)
 		return
 	}
+	// i file senza digest di GitHub si verificano con SHA256SUMS.txt, se la
+	// release lo pubblica; senza, si archiviano lo stesso (nessun obbligo:
+	// l'archivio non installa niente)
+	// la firma si controlla sempre: una release firmata male, o che doveva
+	// esserlo e non lo è, non si archivia
+	fr, err := a.verificaRelease(ctx, v, r)
+	if err != nil {
+		a.fallito(ctx, v, modoArchivio, r.Tag, err)
+		return
+	}
+	if fr.Firmata() {
+		r = fr.Release
+		a.log(v.Nome + ": firma di SHA256SUMS.txt valida")
+	} else if somme, err := a.nuovoCli(v.token).Somme(ctx, v.Repo, r); err != nil {
+		a.log(v.Nome + ": SHA256SUMS.txt non si è letto (" + err.Error() + "): i file senza digest non saranno verificati")
+	} else if somme != nil {
+		r = r.ConSomme(somme)
+	}
 	a.fase(v.ID, "download")
 	ris, err := scarica.Scarica(ctx, a.nuovoCli(v.token), v.Repo, r, v.CartellaArchivio, a.avanzamento(v.ID))
 	if err != nil {
@@ -978,6 +1076,12 @@ func (a *App) archivia(ctx context.Context, v voce) {
 	messaggio := fmt.Sprintf("Release %s archiviata (%d file)", r.Tag, len(ris.File))
 	if ris.GiaPresente {
 		messaggio = "Release " + r.Tag + " già archiviata"
+	} else {
+		messaggio += fmt.Sprintf(", %d pacchetti verificati con SHA-256", len(ris.Verificati))
+		if n := len(ris.NonVerificati); n > 0 {
+			messaggio += fmt.Sprintf(", %d senza somma pubblicata", n)
+			a.log(v.Nome + ": non verificabili (la release non pubblica la loro somma): " + strings.Join(ris.NonVerificati, ", "))
+		}
 	}
 	a.log(v.Nome + ": " + messaggio + " in " + ris.Cartella)
 	a.annota(v.ID, modoArchivio, true, r.Tag, messaggio)
@@ -994,6 +1098,10 @@ type Opzioni struct {
 	// (l'unico adatto, o quello dello stesso genere di ciò che è installato).
 	Asset string `json:"asset"`
 	Tipo  string `json:"tipo"`
+	// Da dice da dove prendere il pacchetto: "" o "github" = dal repository,
+	// "archivio" = dalla cartella d'archivio del repository (Tag allora è il
+	// nome della sua sottocartella).
+	Da string `json:"da"`
 	// Sostituisci va messo a vero solo dopo la conferma dell'utente, quando
 	// sul computer c'è un programma con quel nome che non ha installato
 	// CentralHub.
@@ -1014,6 +1122,10 @@ type SceltaRelease struct {
 // Scelte è ciò fra cui l'utente sceglie prima di installare.
 type Scelte struct {
 	Release []SceltaRelease `json:"release"`
+	// Archivio: le release già nella cartella d'archivio che hanno un
+	// pacchetto per questo sistema, dalla più recente. Vuoto se il
+	// repository non ha un archivio, o non ha niente di installabile.
+	Archivio []SceltaRelease `json:"archivio"`
 	// Avviso spiega perché l'elenco è ridotto alla sola ultima release.
 	Avviso string `json:"avviso"`
 }
@@ -1086,11 +1198,16 @@ func (a *App) Scelte(id string) (Scelte, error) {
 	}
 	ctx, annulla := context.WithTimeout(padre, time.Minute)
 	defer annulla()
+	arch := a.scelteArchivio(v)
 	ultima, err := a.ultima(ctx, v)
 	if err != nil {
-		return Scelte{}, err
+		if len(arch) == 0 {
+			return Scelte{}, err
+		}
+		// Release vuoto e non nil: nel JSON nil diventa null e l'interfaccia lo scorre
+		return Scelte{Release: []SceltaRelease{}, Archivio: arch, Avviso: "GitHub non risponde (" + err.Error() + "): si può installare dall'archivio."}, nil
 	}
-	var s Scelte
+	s := Scelte{Release: []SceltaRelease{}, Archivio: arch}
 	tutte, err := a.elenco(ctx, v)
 	if err != nil {
 		// l'ultima si conosce già: si può installare almeno quella
@@ -1111,7 +1228,7 @@ func (a *App) Scelte(id string) (Scelte, error) {
 				Ultima: r.Tag == ultima.Tag, Pacchetti: p})
 		}
 	}
-	if len(s.Release) == 0 {
+	if len(s.Release) == 0 && len(arch) == 0 {
 		return Scelte{}, installa.ErrNessunAsset
 	}
 	a.avvisa(id)
@@ -1145,7 +1262,134 @@ func daAggiornare(v Vista) bool {
 	return v.Aggiorna && v.Ambito != "" && !v.Scelta
 }
 
+// scelteArchivio elenca le release della cartella d'archivio che si possono
+// installare su questo sistema. Legge solo i nomi dei file.
+func (a *App) scelteArchivio(v voce) []SceltaRelease {
+	if v.CartellaArchivio == "" {
+		return nil
+	}
+	var out []SceltaRelease
+	for _, nome := range scarica.Scaricate(v.CartellaArchivio) {
+		if len(out) >= 30 {
+			break
+		}
+		file := scarica.FileDellaRelease(v.CartellaArchivio, nome)
+		nomi := make([]string, len(file))
+		for i, f := range file {
+			nomi[i] = f.Nome
+		}
+		c, err := installa.Candidati(nomi, runtime.GOOS, runtime.GOARCH, v.Asset)
+		if err != nil || len(c) == 0 {
+			continue
+		}
+		for i := range c {
+			for _, f := range file {
+				if f.Nome == c[i].Nome {
+					c[i].Dimensione = f.Dimensione
+				}
+			}
+		}
+		out = append(out, SceltaRelease{Tag: nome, Nome: nome, Ultima: len(out) == 0, Pacchetti: c})
+	}
+	return out
+}
+
+// piano è ciò che resta deciso prima di scaricare e installare.
+type piano struct {
+	tag      string
+	fissata  bool // una versione scelta che non è l'ultima
+	p        installa.Pacchetto
+	stato    installa.Stato
+	ambito   string
+	cartelle installa.Cartelle
+	reg      string
+}
+
+// pianifica fa i controlli comuni a ogni installazione: se la versione c'è
+// già, quale pacchetto, se il programma c'è già in un altro modo o non è
+// nostro, dove metterlo. Se qualcosa non va lo annota e restituisce nil.
+// vecchia dice che la release non è l'ultima (solo per i messaggi).
+func (a *App) pianifica(ctx context.Context, v voce, o Opzioni, tag string, pacchetti []installa.Pacchetto, fissata, vecchia bool) *piano {
+	reg, err := a.cartellaRegistro()
+	if err != nil {
+		a.fallito(ctx, v, modoUpdate, tag, err)
+		return nil
+	}
+	a.mu.Lock()
+	cartelle := a.cartelle
+	a.mu.Unlock()
+	stato := installa.LeggiStato(reg, v.Nome, runtime.GOOS, cartelle)
+	if (stato.Nostro && stato.Tag == tag) || stessaVersione(tag, stato.Versione) {
+		messaggio := "Già aggiornato alla " + tag
+		if vecchia {
+			messaggio = "La " + tag + " è già installata"
+		}
+		a.log(v.Nome + ": " + messaggio)
+		a.annota(v.ID, modoUpdate, true, tag, messaggio)
+		return nil
+	}
+	// niente discese di versione di nascosto: se l'ultima release è più
+	// vecchia di quella installata (un attacco che ripubblica una versione
+	// vecchia e vulnerabile, o un errore), si installa solo se l'utente sceglie
+	// quella versione
+	if o.Tag == "" && !fissata && stato.Presente {
+		corrente := stato.Versione
+		if stato.Nostro {
+			corrente = stato.Tag
+		}
+		if scarica.ConfrontaVersioni(tag, corrente) < 0 {
+			a.fallito(ctx, v, modoUpdate, tag, fmt.Errorf("la release più recente (%s) è più vecchia di quella installata (%s): non scendo di versione da solo; se la vuoi davvero, scegli la versione dalla finestra di installazione", tag, corrente))
+			return nil
+		}
+	}
+	// quale pacchetto: quello scelto dall'utente; altrimenti, se il
+	// programma c'è già, uno dello stesso genere; altrimenti l'unico adatto
+	var installato installa.Pacchetto
+	if stato.Presente {
+		installato = installa.Pacchetto{Nome: stato.Asset, Tipo: stato.Tipo}
+	}
+	p, err := installa.Scegli(pacchetti, installa.Pacchetto{Nome: o.Asset, Tipo: o.Tipo}, installato)
+	if err != nil {
+		a.fallito(ctx, v, modoUpdate, tag, err)
+		return nil
+	}
+	if stato.Presente && !installa.StessoGenere(p.Tipo, stato.Tipo) {
+		a.fallito(ctx, v, modoUpdate, tag, errors.New("il programma è installato in un altro modo ("+stato.Tipo+"): per passare a "+p.Tipo+" va prima disinstallato"))
+		return nil
+	}
+	if stato.Presente && !stato.Nostro && !o.Sostituisci {
+		a.fallito(ctx, v, modoUpdate, tag, fmt.Errorf("c'è già un programma con questo nome non installato da CentralHub (%s): va confermata la sostituzione", stato.Percorso))
+		return nil
+	}
+	// dove: se c'è già si resta dov'è, altrimenti dove ha scelto l'utente.
+	// Un installatore decide da sé.
+	ambito := v.Ambito
+	if stato.Presente {
+		ambito = stato.Ambito
+	}
+	if ambito == "" && !installa.DaSistema(p.Tipo) {
+		a.fallito(ctx, v, modoUpdate, tag, errors.New("va scelto dove installare: solo per te o per tutto il computer"))
+		return nil
+	}
+	return &piano{tag: tag, fissata: fissata, p: p, stato: stato, ambito: ambito, cartelle: cartelle, reg: reg}
+}
+
+// sommaDi cerca la somma SHA-256 di un file di una release nel suo
+// SHA256SUMS.txt. Vuota (senza errore) se la release non lo pubblica o non
+// elenca quel file.
+func (a *App) sommaDi(ctx context.Context, v voce, r *github.Release, nome string) (string, error) {
+	somme, err := a.nuovoCli(v.token).Somme(ctx, v.Repo, r)
+	if err != nil {
+		return "", fmt.Errorf("SHA256SUMS.txt non si è letto: %w", err)
+	}
+	return somme[nome], nil
+}
+
 func (a *App) aggiorna(ctx context.Context, v voce, o Opzioni) {
+	if o.Da == "archivio" {
+		a.aggiornaDaArchivio(ctx, v, o)
+		return
+	}
 	ultima, err := a.ultima(ctx, v)
 	if err != nil {
 		a.fallito(ctx, v, modoUpdate, "", err)
@@ -1158,90 +1402,158 @@ func (a *App) aggiorna(ctx context.Context, v voce, o Opzioni) {
 			return
 		}
 	}
-	reg, err := a.cartellaRegistro()
-	if err != nil {
-		a.fallito(ctx, v, modoUpdate, r.Tag, err)
+	pi := a.pianifica(ctx, v, o, r.Tag, a.pacchetti(v, r), r != ultima, r != ultima)
+	if pi == nil {
 		return
 	}
-	a.mu.Lock()
-	cartelle := a.cartelle
-	a.mu.Unlock()
-	stato := installa.LeggiStato(reg, v.Nome, runtime.GOOS, cartelle)
-	if (stato.Nostro && stato.Tag == r.Tag) || stessaVersione(r.Tag, stato.Versione) {
-		messaggio := "Già aggiornato alla " + r.Tag
-		if r != ultima {
-			messaggio = "La " + r.Tag + " è già installata"
+	a.installaScelto(ctx, v, pi, func(lavoro string) (string, error) {
+		a.fase(v.ID, "download")
+		// la firma si controlla sempre; le somme firmate valgono più del digest
+		fr, err := a.verificaRelease(ctx, v, r)
+		if err != nil {
+			return "", err
 		}
-		a.log(v.Nome + ": " + messaggio)
-		a.annota(v.ID, modoUpdate, true, r.Tag, messaggio)
-		return
-	}
-	// quale pacchetto: quello scelto dall'utente; altrimenti, se il
-	// programma c'è già, uno dello stesso genere; altrimenti l'unico adatto
-	var installato installa.Pacchetto
-	if stato.Presente {
-		installato = installa.Pacchetto{Nome: stato.Asset, Tipo: stato.Tipo}
-	}
-	p, err := installa.Scegli(a.pacchetti(v, r), installa.Pacchetto{Nome: o.Asset, Tipo: o.Tipo}, installato)
-	if err != nil {
-		a.fallito(ctx, v, modoUpdate, r.Tag, err)
-		return
-	}
-	if stato.Presente && !installa.StessoGenere(p.Tipo, stato.Tipo) {
-		a.fallito(ctx, v, modoUpdate, r.Tag, errors.New("il programma è installato in un altro modo ("+stato.Tipo+"): per passare a "+p.Tipo+" va prima disinstallato"))
-		return
-	}
-	if stato.Presente && !stato.Nostro && !o.Sostituisci {
-		a.fallito(ctx, v, modoUpdate, r.Tag, fmt.Errorf("c'è già un programma con questo nome non installato da CentralHub (%s): va confermata la sostituzione", stato.Percorso))
-		return
-	}
-	// dove: se c'è già si resta dov'è, altrimenti dove ha scelto l'utente.
-	// Un installatore decide da sé.
-	ambito := v.Ambito
-	if stato.Presente {
-		ambito = stato.Ambito
-	}
-	if ambito == "" && !installa.DaSistema(p.Tipo) {
-		a.fallito(ctx, v, modoUpdate, r.Tag, errors.New("va scelto dove installare: solo per te o per tutto il computer"))
-		return
-	}
+		rr := fr.Release
+		if fr.Firmata() {
+			if _, ok := fr.Somme[pi.p.Nome]; !ok {
+				return "", fmt.Errorf("%s non è nell'elenco firmato delle somme", pi.p.Nome)
+			}
+			a.log(v.Nome + ": firma di SHA256SUMS.txt valida")
+		} else {
+			a.log(v.Nome + ": release non firmata (si usa il digest di GitHub o SHA256SUMS.txt)")
+		}
+		var asset github.Asset
+		for _, as := range rr.Assets {
+			if as.Nome == pi.p.Nome {
+				asset = as
+			}
+		}
+		if asset.Digest == "" {
+			// GitHub non dà il digest di questo file (è anteriore al 2025):
+			// la somma si cerca in SHA256SUMS.txt. Senza nessuna delle due,
+			// scarica.Asset rifiuta di installarlo.
+			somma, err := a.sommaDi(ctx, v, r, asset.Nome)
+			if err != nil {
+				return "", err
+			}
+			if somma != "" {
+				asset.Digest = "sha256:" + somma
+			}
+		}
+		return scarica.Asset(ctx, a.nuovoCli(v.token), v.Repo, asset, lavoro, a.avanzamento(v.ID))
+	})
+}
 
-	a.fase(v.ID, "download")
-	var asset github.Asset
-	for _, as := range r.Assets {
-		if as.Nome == p.Nome {
-			asset = as
+// aggiornaDaArchivio installa un pacchetto che sta già nella cartella
+// d'archivio del repository: niente rete, e l'archivio non si tocca (il
+// pacchetto si copia nella cartella di lavoro). La somma si controlla se si
+// conosce: nel SHA256SUMS.txt archiviato accanto ai pacchetti, o nel digest
+// della release se è quella che GitHub ha ancora; altrimenti si installa lo
+// stesso, perché l'archivio è dell'utente, e si scrive nel registro.
+func (a *App) aggiornaDaArchivio(ctx context.Context, v voce, o Opzioni) {
+	if v.CartellaArchivio == "" {
+		a.fallito(ctx, v, modoUpdate, o.Tag, errors.New("non è stata scelta la cartella d'archivio di questo repository"))
+		return
+	}
+	cartellaRel := o.Tag
+	if cartellaRel == "" {
+		s := scarica.Scaricate(v.CartellaArchivio)
+		if len(s) == 0 {
+			a.fallito(ctx, v, modoUpdate, "", errors.New("l'archivio di questo repository è vuoto"))
+			return
+		}
+		cartellaRel = s[0]
+	}
+	if cartellaRel != filepath.Base(cartellaRel) || strings.HasPrefix(cartellaRel, ".") || !scarica.Presente(v.CartellaArchivio, cartellaRel) {
+		a.fallito(ctx, v, modoUpdate, cartellaRel, fmt.Errorf("la release %q non è nell'archivio", cartellaRel))
+		return
+	}
+	file := scarica.FileDellaRelease(v.CartellaArchivio, cartellaRel)
+	nomi := make([]string, len(file))
+	for i, f := range file {
+		nomi[i] = f.Nome
+	}
+	pacchetti, err := installa.Candidati(nomi, runtime.GOOS, runtime.GOARCH, v.Asset)
+	if err != nil {
+		a.fallito(ctx, v, modoUpdate, cartellaRel, fmt.Errorf("nell'archivio, %s: %w", cartellaRel, err))
+		return
+	}
+	// il tag vero, se è la release che GitHub ha dato per ultima
+	a.mu.Lock()
+	nota := a.ultime[v.ID]
+	a.mu.Unlock()
+	tag, fissata := cartellaRel, false
+	if nota != nil {
+		if scarica.NomeCartella(nota.Tag) == cartellaRel {
+			tag = nota.Tag
+		} else {
+			fissata = true
 		}
 	}
+	pi := a.pianifica(ctx, v, o, tag, pacchetti, fissata, fissata)
+	if pi == nil {
+		return
+	}
+	a.installaScelto(ctx, v, pi, func(lavoro string) (string, error) {
+		a.fase(v.ID, "copia")
+		atteso := scarica.SommeArchiviate(v.CartellaArchivio, cartellaRel)[pi.p.Nome]
+		somme, firmata, err := a.firmateDallArchivio(v, cartellaRel, tag)
+		if err != nil {
+			return "", err
+		}
+		if firmata {
+			if atteso = somme[pi.p.Nome]; atteso == "" {
+				return "", fmt.Errorf("%s non è nell'elenco firmato delle somme", pi.p.Nome)
+			}
+			a.log(v.Nome + ": firma di SHA256SUMS.txt valida (archivio)")
+		} else if atteso == "" && nota != nil && tag == nota.Tag {
+			for _, as := range nota.Assets {
+				if as.Nome == pi.p.Nome {
+					atteso = strings.TrimPrefix(strings.ToLower(as.Digest), "sha256:")
+				}
+			}
+		}
+		file, verificato, err := scarica.DallArchivio(ctx, filepath.Join(v.CartellaArchivio, cartellaRel, pi.p.Nome), lavoro, atteso, a.avanzamento(v.ID))
+		if err == nil && !verificato {
+			a.log(v.Nome + ": " + pi.p.Nome + " dall'archivio non si è potuto verificare (nessuna somma di controllo nota)")
+		}
+		return file, err
+	})
+}
+
+// installaScelto porta il pacchetto nella cartella di lavoro (dal sito o
+// dall'archivio, lo dice ottieni) e lo installa.
+func (a *App) installaScelto(ctx context.Context, v voce, pi *piano, ottieni func(lavoro string) (string, error)) {
 	lavoro, err := a.cartellaLavoro()
 	if err != nil {
-		a.fallito(ctx, v, modoUpdate, r.Tag, err)
+		a.fallito(ctx, v, modoUpdate, pi.tag, err)
 		return
 	}
 	lavoro = filepath.Join(lavoro, installa.NomeProgramma(v.Nome))
 	defer os.RemoveAll(lavoro)
-	file, err := scarica.Asset(ctx, a.nuovoCli(v.token), v.Repo, asset, lavoro, a.avanzamento(v.ID))
+	file, err := ottieni(lavoro)
 	if err != nil {
-		a.fallito(ctx, v, modoUpdate, r.Tag, err)
+		a.fallito(ctx, v, modoUpdate, pi.tag, err)
 		return
 	}
-
+	p, stato := pi.p, pi.stato
 	if installa.DaSistema(p.Tipo) {
 		a.fase(v.ID, "installatore")
 	} else {
 		a.fase(v.ID, "installazione")
 	}
-	e, err := installa.Installa(installa.Richiesta{ID: v.ID, Nome: v.Nome, Repo: v.Repo, Tag: r.Tag, File: file, Tipo: p.Tipo,
-		Ambito: ambito, Fissata: r != ultima, Cartelle: cartelle, CartellaRegistro: reg, Ctx: ctx})
+	e, err := installa.Installa(installa.Richiesta{ID: v.ID, Nome: v.Nome, Repo: v.Repo, Tag: pi.tag, File: file, Tipo: p.Tipo,
+		Ambito: pi.ambito, Fissata: pi.fissata, Cartelle: pi.cartelle, CartellaRegistro: pi.reg, Ctx: ctx})
 	if err != nil {
-		a.fallito(ctx, v, modoUpdate, r.Tag, fmt.Errorf("installazione non riuscita: %w", err))
+		a.fallito(ctx, v, modoUpdate, pi.tag, fmt.Errorf("installazione non riuscita: %w", err))
 		return
 	}
+	a.annotaIntegrita(v, pi.reg, p.Tipo, e)
 	verbo := "Installato"
 	if stato.Presente {
 		verbo = "Aggiornato"
 	}
-	messaggio := verbo + " alla " + r.Tag
+	messaggio := verbo + " alla " + pi.tag
 	switch {
 	case e.Percorso != "":
 		messaggio += " in " + e.Percorso
@@ -1259,7 +1571,7 @@ func (a *App) aggiorna(ctx context.Context, v voce, o Opzioni) {
 		messaggio += ". Chiudi e riapri CentralHub per usare la versione nuova"
 	}
 	a.log(v.Nome + ": " + messaggio + " (" + e.Asset + ")")
-	a.annota(v.ID, modoUpdate, true, r.Tag, messaggio)
+	a.annota(v.ID, modoUpdate, true, pi.tag, messaggio)
 }
 
 // ---------------------------------------------------------------- disinstallazione
@@ -1348,6 +1660,10 @@ func (a *App) disinstalla(ctx context.Context, v voce, togliDati bool) {
 			a.log(v.Nome + ": " + err.Error())
 		}
 	}
+	integrita.Elimina(reg, installa.NomeProgramma(v.Nome))
+	a.mu.Lock()
+	delete(a.integri, v.ID)
+	a.mu.Unlock()
 	messaggio := "Disinstallato"
 	if e.Percorso != "" {
 		messaggio += " da " + e.Percorso

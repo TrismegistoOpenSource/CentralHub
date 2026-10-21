@@ -1,4 +1,4 @@
-# CentralHub 0.2.1
+# CentralHub 0.2.2
 
 Tiene in ordine i programmi che arrivano da repository GitHub: **archivia**
 le loro release e li **installa e aggiorna** sul computer. Scritto in Go +
@@ -58,11 +58,21 @@ archivi dei sorgenti.
 
 - **Una release a metà non compare mai**: si scarica in una cartella
   provvisoria nascosta (`.<tag>.parziale`) che prende il nome definitivo solo
-  a download completo e verificato (dimensione e, quando GitHub lo fornisce,
-  SHA-256).
+  a download completo e verificato.
+- **Ogni pacchetto è verificato con il suo SHA-256**: il digest che GitHub
+  dà a ogni file o, se manca, il `SHA256SUMS.txt` della release. Un file che
+  non corrisponde non si tiene mai. Quando la release finisce nell'archivio
+  CentralHub dice quanti pacchetti ha verificato e quali non hanno una somma
+  pubblicata (gli archivi dei sorgenti non ne hanno), e annota le somme in un
+  file nascosto (`.centralhub-sha256.txt`) per ricontrollarli quando si
+  installa dall'archivio.
 - **Un download interrotto riparte da dove era**: i file già arrivati interi
   restano nella cartella provvisoria e il tentativo successivo non li
-  riscarica. Un file a metà non viene mai tenuto.
+  riscarica; anche un file a metà si tiene (`.part`) e si riprende con una
+  richiesta `Range`, senza ricominciarlo. Se la connessione cade durante il
+  download, CentralHub riprova da solo con attese crescenti (2, 4, 8… fino a
+  30 secondi) e si ferma solo dopo otto tentativi senza un byte in più.
+  **Interrompi** quindi è anche una pausa: «Archivia» di nuovo e riparte.
 - **Una release già archiviata si salta.**
 - Non installa niente.
 
@@ -146,9 +156,63 @@ cambia da «Modifica».
 - **Trova da solo l'ultima release** a ogni controllo: nessun link da
   aggiornare a mano. Bozze e prerelease non contano.
 - **Due LED per repository**: l'esito dell'ultimo lavoro, e *aggiornato*
-  (verde) / *da aggiornare* (rosso), calcolato all'apertura.
-- **Un pulsante per tutti**, oppure un repository alla volta.
-- **Tag** per raggruppare i repository e filtrarli.
+  (verde) / *da aggiornare* (rosso). All'apertura si disegnano subito con
+  l'ultima release vista l'ultima volta (`ultime.json`), prima di qualunque
+  richiesta; il passaggio del mouse sulla «Ultima release» dice quando è
+  stata controllata.
+- **Un pulsante per tutti**, oppure un repository alla volta: ogni scheda ha
+  il suo **Controlla** (guarda se è uscita una release nuova, senza fare
+  altro) e il suo **Vai al repo** (apre nel browser la pagina del progetto su
+  GitHub, non la release). **Novità** mostra le note dell'ultima release.
+- **Installa e Aggiorna controllano prima quel repository**: non si usa mai
+  una release vecchia, anche se il controllo all'apertura l'aveva saltato.
+- **Installare dall'archivio**: se un repository ha una cartella d'archivio
+  con una release installabile su questo sistema, la finestra di
+  installazione permette di scegliere **Da GitHub** (predefinito) o
+  **Dall'archivio**, anche senza rete. Il pacchetto si copia nella cartella
+  di lavoro (l'archivio non si tocca) e si controlla contro la somma annotata
+  o pubblicata.
+- **Un pacchetto senza somma di controllo non si installa**: né il digest di
+  GitHub né un `SHA256SUMS.txt` lo garantiscono, quindi CentralHub rifiuta.
+  Ogni release dei programmi dell'autore pubblica anche `SHA256SUMS.txt`.
+- **Firma delle release, sempre controllata.** Chi pubblica i propri
+  programmi firma il `SHA256SUMS.txt` con una chiave privata (ed25519) che tiene
+  sul proprio computer, e carica la firma (`SHA256SUMS.txt.sig`) sulla release.
+  La firma è legata al **repository e al tag**: quella di una release non vale
+  per un'altra. CentralHub la verifica **sempre**, con le chiavi pubbliche
+  incorporate (`internal/firma/chiavi.go`):
+  1. se la release ha una firma nel nostro formato, deve tornare, per
+     qualunque repository, altrimenti la release si rifiuta (una firma in un
+     altro formato, per esempio minisign, non è nostra e si ignora);
+  2. se la firma manca, la release si rifiuta quando la firma è *attesa*:
+     l'interruttore «Rifiuta le release non firmate» del repository è acceso
+     (si accende da solo, per sempre, appena CentralHub vede una release firmata
+     di quel repository), oppure il repository è di un proprietario che firma
+     (`trismegistoopensource`) e la release è stata pubblicata dopo il
+     21/10/2026: così togliere la firma da GitHub non basta a farla ignorare,
+     nemmeno a chi aggiunge il repository per la prima volta;
+  3. altrimenti (repository di terzi, release di prima della firma) si procede
+     come prima, con il digest di GitHub o il `SHA256SUMS.txt`, e il registro
+     scrive «release non firmata».
+  Le somme firmate valgono più del digest di GitHub, e se i due non coincidono
+  la release è considerata alterata. CentralHub non scende di versione da solo:
+  se l'ultima release è più vecchia di quella installata, rifiuta (scegliendo
+  la versione a mano si può). La verifica costa circa 0,06 millisecondi e si
+  fa al momento di installare. Lo strumento di chi pubblica è `cmd/firma`
+  (`go run ./cmd/firma genera` crea la coppia di chiavi) e
+  `scripts/firma-release.sh <repo> <tag>` firma una release già pubblicata.
+- **Integrità dei programmi installati.** Quando CentralHub installa un
+  programma annota gli SHA-256 dei suoi file (da un pacchetto già
+  verificato); a ogni apertura li ricalcola in un thread a parte e la scheda
+  dice «Integrità: ok» oppure «file diversi» (con i nomi nel suggerimento).
+  Si confrontano solo i file annotati: le impostazioni che un programma
+  scrive accanto a sé non contano. Un programma da 70 MB si controlla in circa
+  60 millisecondi. Non vale per ciò che installa il sistema (`.deb`, `.pkg`,
+  installatori), che ha già i suoi controlli.
+- **Tag** per raggruppare i repository e filtrarli; **ricerca** per nome,
+  repository o tag, e filtro **Da aggiornare**.
+- **Una sola copia aperta**: lanciarne una seconda riporta avanti la prima
+  (due copie si sovrascriverebbero `config.json`).
 - Togliere un repository dalla lista non cancella niente dal disco.
 
 ## Repository pubblici e privati
@@ -196,9 +260,14 @@ esempio) non valgono e vengono lasciati vuoti. I file della 0.1.0 si
 importano senza perdere niente.
 
 Per i repository **pubblici** GitHub concede 60 richieste all'ora a tutto il
-computer. CentralHub ne usa una sola per repository, per sapere qual è
-l'ultima release; i file li prende dal loro indirizzo pubblico
-(`github.com/…/releases/download/…`), che non consuma quel limite.
+computer, e un controllo di tutti rischiava di esaurirle. Ora l'ultima
+release la si legge dal **sito** e non dall'API: `github.com/<repo>/releases/latest`
+risponde con un redirect che nomina il tag, e quella richiesta non consuma
+niente. L'API (una richiesta per repository) serve solo quando il tag è
+cambiato o l'elenco dei pacchetti ricordato ha più di un giorno. I file si
+prendono dal loro indirizzo pubblico (`github.com/…/releases/download/…`),
+che non consuma quel limite. I repository con una chiave usano l'API (5000
+all'ora) e all'apertura si controllano al massimo una volta all'ora.
 
 ## Dove salva i dati
 
@@ -206,6 +275,8 @@ l'ultima release; i file li prende dal loro indirizzo pubblico
 |---|---|
 | Repository, loro chiavi, tag, cartelle d'archivio, dove installare | `config.json` nella cartella di configurazione del sistema (`~/Library/Application Support/CentralHub`, `%APPDATA%\CentralHub`, `~/.config/CentralHub`); a ogni salvataggio resta la copia `config.json.bak` |
 | Esito dell'ultimo lavoro | `stato.json`, nella stessa cartella |
+| Ultima release vista di ogni repository (note comprese) | `ultime.json`, nella stessa cartella |
+| Somme SHA-256 dei file installati | `installati/<Nome>.integrita.json`, nella stessa cartella |
 | Cosa ha installato, e in quale versione | `installati/<Nome>.json`, nella stessa cartella |
 
 Il file sta fuori dalla cartella del programma: **aggiornare CentralHub non
@@ -253,6 +324,7 @@ internal/github/           ultima release e download dall'API di GitHub
 internal/scarica/          download atomico di una release, o di un pacchetto
 internal/installa/         installa e aggiorna il programma, per l'utente o per tutti
 cmd/githubfinto/           un GitHub di prova locale
+cmd/firma/                 crea le chiavi e firma il SHA256SUMS.txt di una release
 frontend/ui/               interfaccia
 scripts/                   build, pacchetto, verifica, prova locale, release
 ```

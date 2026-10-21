@@ -19,6 +19,8 @@ const stato = {
   panoramica: null,
   modo: localStorage.getItem("modo") === "archivio" ? "archivio" : "update",
   tag: null,        // filtro: null = tutti
+  cerca: "",        // filtro di testo
+  soloAgg: false,   // filtro: solo i repository da aggiornare
   inModifica: null, // id del repository nella finestra, null = nuovo
   ambito: "",
 };
@@ -74,7 +76,7 @@ function riga(testo) {
 // ---- le due modalità ---------------------------------------------------------
 
 const FASI = {
-  controllo: "Controllo l'ultima release…", download: "Download", installazione: "Installazione…",
+  controllo: "Controllo l'ultima release…", download: "Download", copia: "Copia dall'archivio…", installazione: "Installazione…",
   installatore: "Installatore aperto: va seguita la sua finestra…",
   disinstallazione: "Disinstallazione… (se si apre una finestra del programma, va seguita)",
 };
@@ -120,7 +122,8 @@ function azione(v) {
 // dove), per un programma fermo su una versione scelta dall'utente, e quando
 // la release ha più pacchetti adatti fra cui CentralHub non sa decidere.
 function daChiedere(v) {
-  return !v.installato.presente || v.installato.fissata || v.scelta;
+  // con una cartella d'archivio che ha già qualcosa si può scegliere di installare da lì
+  return !v.installato.presente || v.installato.fissata || v.scelta || (!!v.cartellaArchivio && !!v.archiviata);
 }
 
 function disegnaRepo(v) {
@@ -138,7 +141,9 @@ function disegnaRepo(v) {
   if (agg === "si") { led2 = "success"; t2 = "Aggiornato"; }
   else if (agg === "no") { led2 = "failed"; t2 = "Da aggiornare"; }
 
-  const versioni = [`<span class="${agg === "no" ? "nuova" : ""}">Ultima release <b>${esc(v.ultimaRelease || "…")}</b></span>`];
+  const visto = v.vistaIl ? new Date(v.vistaIl) : null;
+  const quandoVisto = visto && !isNaN(visto) ? "Controllata il " + visto.toLocaleString("it-IT") : "Non ancora controllata";
+  const versioni = [`<span class="${agg === "no" ? "nuova" : ""}" title="${esc(quandoVisto)}">Ultima release <b>${esc(v.ultimaRelease || "…")}</b></span>`];
   if (archivio) {
     versioni.push(`<span>Archiviata <b>${esc(v.cartellaArchivio ? (v.archiviata || "nessuna") : "—")}</b></span>`);
   } else {
@@ -151,6 +156,11 @@ function disegnaRepo(v) {
       inst += " · andrà: " + AMBITI[v.ambito];
     }
     versioni.push(`<span>Installato <b>${esc(inst)}</b></span>`);
+    if (v.integrita === "ok") {
+      versioni.push(`<span title="Gli SHA-256 dei file installati sono quelli annotati da CentralHub al momento dell'installazione">Integrità <b>ok</b></span>`);
+    } else if (v.integrita === "diversa") {
+      versioni.push(`<span class="diversa" title="${esc("Diversi da come CentralHub li ha installati: " + (v.integritaFile || []).join(", "))}">Integrità <b>file diversi</b></span>`);
+    }
   }
 
   let esito = "", classe = "";
@@ -186,6 +196,9 @@ function disegnaRepo(v) {
 
   const percorso = archivio ? v.cartellaArchivio : (v.installato.presente ? v.installato.percorso : "");
   const secondari = [];
+  secondari.push(`<button class="btn ghost small" data-az="controlla" ${lavora ? "disabled" : ""} title="Chiede a GitHub se per questo repository è uscita una release nuova, senza fare altro">Controlla</button>`);
+  secondari.push(`<button class="btn ghost small" data-az="repo" title="Apre nel browser la pagina del progetto su GitHub">Vai al repo</button>`);
+  if (v.haNote) secondari.push(`<button class="btn ghost small" data-az="novita" title="Le note dell'ultima release">Novità</button>`);
   if (percorso) secondari.push(`<button class="btn ghost small" data-az="apri" title="${esc(percorso)}">Cartella</button>`);
   if (!archivio && !v.installato.presente && v.installabile !== "no" && !v.manca) {
     secondari.push(`<button class="btn ghost small" data-az="segui" ${lavora ? "disabled" : ""} title="I programmi seguiti vengono installati e aggiornati da «Aggiorna tutti»">${v.aggiorna ? "Non seguire" : "Segui"}</button>`);
@@ -205,7 +218,7 @@ function disegnaRepo(v) {
       <span class="led-riga" title="${esc(t2)}"><span class="status-dot ${led2}"></span>${esc(t2)}</span>
     </div>
     <div class="card-body">
-      <div class="card-title"><h3>${esc(v.nome)}</h3><span class="card-repo">${esc(v.repo)}</span>${v.privato ? `<span class="etichetta ${v.manca ? "manca" : ""}" title="${v.manca ? "Repository privato: manca la chiave di accesso" : "Repository privato, con la sua chiave di accesso"}">${v.manca ? "privato · manca la chiave" : "privato"}</span>` : ""}</div>
+      <div class="card-title"><h3>${esc(v.nome)}</h3><span class="card-repo">${esc(v.repo)}</span>${v.firmaRichiesta ? `<span class="etichetta" title="La firma di SHA256SUMS.txt si controlla sempre; per questo repository una release non firmata si rifiuta">firma richiesta</span>` : ""}${v.privato ? `<span class="etichetta ${v.manca ? "manca" : ""}" title="${v.manca ? "Repository privato: manca la chiave di accesso" : "Repository privato, con la sua chiave di accesso"}">${v.manca ? "privato · manca la chiave" : "privato"}</span>` : ""}</div>
       <div class="card-versioni">${versioni.join("")}</div>
       ${percorso ? `<div class="card-path" title="${esc(percorso)}">&#x202A;${esc(percorso)}&#x202C;</div>` : ""}
       <div class="card-esito ${classe}">${esc(esito)}</div>
@@ -219,7 +232,11 @@ function disegnaRepo(v) {
 }
 
 function visibili() {
-  return stato.ordine.map((i) => stato.repo.get(i)).filter((v) => stato.tag === null || (v.tag || "") === stato.tag);
+  const cerca = stato.cerca.trim().toLowerCase();
+  return stato.ordine.map((i) => stato.repo.get(i))
+    .filter((v) => stato.tag === null || (v.tag || "") === stato.tag)
+    .filter((v) => !stato.soloAgg || aggiornato(v) === "no")
+    .filter((v) => !cerca || [v.nome, v.repo, v.tag].some((s) => (s || "").toLowerCase().includes(cerca)));
 }
 
 function disegnaLista() {
@@ -374,9 +391,10 @@ async function imposta(v, cambi) {
   return nuova;
 }
 
-// chiediInstallazione fa scegliere quale versione installare, quale
-// pacchetto e (alla prima installazione) dove. Restituisce
-// { opzioni: { tag, asset, tipo }, ambito } oppure null se l'utente rinuncia.
+// chiediInstallazione fa scegliere da dove installare (GitHub o, se il
+// repository ha un'archivio con qualcosa di installabile, l'archivio), quale
+// versione, quale pacchetto e (alla prima installazione) dove. Restituisce
+// { opzioni: { tag, asset, tipo, da }, ambito } oppure null se l'utente rinuncia.
 // Se non c'è niente da scegliere non apre nessuna finestra.
 function chiediInstallazione(v, scelte) {
   const installato = v.installato.presente;
@@ -388,17 +406,23 @@ function chiediInstallazione(v, scelte) {
     const esatti = r.pacchetti.filter((p) => p.tipo === v.installato.tipo);
     return esatti.length > 0 ? esatti : r.pacchetti.filter((p) => genere(p.tipo) === genere(v.installato.tipo));
   };
-  const release = scelte.release.filter((r) => adatti(r).length > 0);
-  if (release.length === 0) {
+  const sorgenti = {
+    github: (scelte.release || []).filter((r) => adatti(r).length > 0),
+    archivio: (scelte.archivio || []).filter((r) => adatti(r).length > 0),
+  };
+  if (sorgenti.github.length === 0 && sorgenti.archivio.length === 0) {
     return Promise.reject(new Error("Nessuna release ha un pacchetto dello stesso genere di quello installato: per cambiare genere il programma va prima disinstallato."));
   }
+  // di default si installa da GitHub; l'archivio è una scelta
+  let da = sorgenti.github.length > 0 ? "github" : "archivio";
+  let release = sorgenti[da];
   let r = release.find((x) => x.ultima) || release[0];
   const predefinito = (x) => { const p = adatti(x); return p.length === 1 ? p[0] : (p.find((y) => y.consigliato) || null); };
   let pacchetto = predefinito(r);
   let ambito = v.ambito || "";
   const serveAmbito = () => !installato && pacchetto && pacchetto.tipo !== "installatore" && pacchetto.tipo !== "deb" && pacchetto.tipo !== "pkg";
-  if (release.length === 1 && adatti(r).length === 1 && !(serveAmbito() && !ambito)) {
-    return Promise.resolve({ opzioni: { tag: r.tag, asset: pacchetto.nome, tipo: pacchetto.tipo }, ambito });
+  if (sorgenti.archivio.length === 0 && release.length === 1 && adatti(r).length === 1 && !(serveAmbito() && !ambito)) {
+    return Promise.resolve({ opzioni: { tag: r.tag, asset: pacchetto.nome, tipo: pacchetto.tipo, da: "github" }, ambito });
   }
 
   return new Promise((risolvi) => {
@@ -406,21 +430,31 @@ function chiediInstallazione(v, scelte) {
     $("inst-ok").textContent = installato ? "Aggiorna" : "Installa";
     $("inst-avviso").textContent = scelte.avviso || "";
     $("inst-avviso").hidden = !scelte.avviso;
-    $("inst-versioni-nota").textContent = release.length === 1 ? "(c'è solo questa)" : "(" + release.length + " release, dalla più recente)";
     const sel = $("inst-versione");
-    sel.replaceChildren(...release.map((x) => {
-      const o = document.createElement("option");
-      o.value = x.tag;
-      const data = x.pubblicata ? new Date(x.pubblicata) : null;
-      o.textContent = x.tag + (x.ultima ? " · ultima" : "") + (x.prerelease ? " · prerelease" : "") +
-        (installato && v.installato.tag === x.tag ? " · installata" : "") +
-        (data && !isNaN(data) ? " · " + data.toLocaleDateString("it-IT") : "");
-      return o;
-    }));
-    sel.value = r.tag;
-    sel.disabled = release.length === 1;
+    const entrambe = sorgenti.github.length > 0 && sorgenti.archivio.length > 0;
+    $("inst-campo-da").hidden = !entrambe;
+
+    const disegnaVersioni = () => {
+      $("inst-versioni-nota").textContent = (da === "archivio" ? "dell'archivio, " : "") +
+        (release.length === 1 ? "c'è solo questa" : release.length + " release, dalla più recente");
+      sel.replaceChildren(...release.map((x) => {
+        const o = document.createElement("option");
+        o.value = x.tag;
+        const data = x.pubblicata ? new Date(x.pubblicata) : null;
+        o.textContent = x.tag + (x.ultima ? (da === "archivio" ? " · la più recente" : " · ultima") : "") + (x.prerelease ? " · prerelease" : "") +
+          (installato && v.installato.tag === x.tag ? " · installata" : "") +
+          (data && !isNaN(data) ? " · " + data.toLocaleDateString("it-IT") : "");
+        return o;
+      }));
+      sel.value = r.tag;
+      sel.disabled = release.length === 1;
+    };
 
     const disegna = () => {
+      document.querySelectorAll("#inst-da button").forEach((b) => {
+        b.classList.toggle("active", b.dataset.da === da);
+        b.disabled = sorgenti[b.dataset.da].length === 0;
+      });
       const p = adatti(r);
       $("inst-pacchetti-nota").textContent = p.length === 1 ? "(questa versione ne ha uno solo per questo computer)" : "(scegli quale)";
       $("inst-pacchetti").replaceChildren(...p.map((x) => {
@@ -437,16 +471,27 @@ function chiediInstallazione(v, scelte) {
     };
     const chiudi = (esito) => {
       $("dlg-installa").hidden = true;
-      sel.onchange = $("inst-ambito").onclick = $("inst-ok").onclick = $("inst-annulla").onclick = null;
+      sel.onchange = $("inst-ambito").onclick = $("inst-da").onclick = $("inst-ok").onclick = $("inst-annulla").onclick = null;
       risolvi(esito);
     };
     sel.onchange = () => { r = release.find((x) => x.tag === sel.value); pacchetto = predefinito(r); disegna(); };
+    $("inst-da").onclick = (ev) => {
+      const b = ev.target.closest("button[data-da]");
+      if (!b || b.disabled || b.dataset.da === da) return;
+      da = b.dataset.da;
+      release = sorgenti[da];
+      r = release.find((x) => x.ultima) || release[0];
+      pacchetto = predefinito(r);
+      disegnaVersioni();
+      disegna();
+    };
     $("inst-ambito").onclick = (ev) => {
       const b = ev.target.closest("button[data-ambito]");
       if (b) { ambito = b.dataset.ambito; disegna(); }
     };
-    $("inst-ok").onclick = () => chiudi({ opzioni: { tag: r.tag, asset: pacchetto.nome, tipo: pacchetto.tipo }, ambito: serveAmbito() ? ambito : v.ambito });
+    $("inst-ok").onclick = () => chiudi({ opzioni: { tag: r.tag, asset: pacchetto.nome, tipo: pacchetto.tipo, da }, ambito: serveAmbito() ? ambito : v.ambito });
     $("inst-annulla").onclick = () => chiudi(null);
+    disegnaVersioni();
     disegna();
     $("dlg-installa").hidden = false;
   });
@@ -455,7 +500,7 @@ function chiediInstallazione(v, scelte) {
 // aggiorna installa un programma o lo aggiorna. Restituisce vero se il
 // lavoro è partito.
 async function aggiorna(v) {
-  const opzioni = { tag: "", asset: "", tipo: "", sostituisci: false };
+  const opzioni = { tag: "", asset: "", tipo: "", da: "", sostituisci: false };
   try {
     if (daChiedere(v)) {
       const scelte = await api().Scelte(v.id);
@@ -551,6 +596,9 @@ $("lista").addEventListener("click", (ev) => {
     case "disinstalla": disinstalla(v); break;
     case "modifica": apriRepo(v); break;
     case "rimuovi": rimuovi(v); break;
+    case "controlla": api().Controlla(v.id); break;
+    case "repo": api().VaiAlRepo(v.id).catch(errore); break;
+    case "novita": mostraNovita(v); break;
   }
 });
 
@@ -587,6 +635,24 @@ async function aggiornaTutti() {
 
 $("btn-tutti").addEventListener("click", () => (stato.modo === "archivio" ? api().ArchiviaTutti() : aggiornaTutti()));
 $("btn-controlla").addEventListener("click", () => api().ControllaTutti());
+$("cerca").addEventListener("input", () => { stato.cerca = $("cerca").value; disegnaLista(); });
+$("filtro-agg").addEventListener("click", () => {
+  stato.soloAgg = !stato.soloAgg;
+  $("filtro-agg").classList.toggle("active", stato.soloAgg);
+  disegnaLista();
+});
+
+// mostraNovita apre le note dell'ultima release, come testo semplice (sono
+// scritte da altri: niente HTML e niente link cliccabili).
+async function mostraNovita(v) {
+  try {
+    const n = await api().Novita(v.id);
+    $("nov-titolo").textContent = v.nome + " · " + (n.nome || n.tag);
+    $("nov-testo").textContent = n.testo || "Questa release non ha note.";
+    $("dlg-novita").hidden = false;
+  } catch (e) { barra(messaggio(e), true); }
+}
+$("nov-chiudi").addEventListener("click", () => { $("dlg-novita").hidden = true; });
 
 // ---- finestra del repository -------------------------------------------------
 
@@ -609,6 +675,7 @@ function apriRepo(v) {
   $("repo-repo").value = v ? v.repo : "";
   $("repo-nome").value = v ? v.nome : "";
   $("repo-privato").checked = v ? v.privato : false;
+  $("repo-firma").checked = v ? v.pretendiFirma : false;
   $("repo-chiave").value = "";
   mostraChiave();
   $("repo-tag").value = v ? v.tag : (stato.tag || "");
@@ -644,7 +711,7 @@ $("repo-salva").addEventListener("click", async () => {
   try {
     const nuova = await api().SalvaRepo(Object.assign({
       id: stato.inModifica || "", nome: $("repo-nome").value, repo: $("repo-repo").value, asset: $("repo-asset").value,
-      privato, token: privato ? $("repo-chiave").value : "",
+      privato, pretendiFirma: $("repo-firma").checked, token: privato ? $("repo-chiave").value : "",
     }, l));
     $("repo-chiave").value = "";
     metti(nuova);
@@ -728,8 +795,9 @@ async function avvia() {
   window.runtime.EventsOn("log", riga);
   await ricarica();
   // All'apertura: c'è qualcosa da aggiornare? Solo se l'ultimo controllo è
-  // di più di un'ora fa; «Controlla» lo fa sempre.
+  // di più di un'ora fa (quelli pubblici sempre: il sito non conta); «Controlla» lo fa sempre.
   api().ControllaAllApertura();
+  api().VerificaIntegrita();
 }
 
 avvia().catch((e) => barra("Avvio non riuscito: " + messaggio(e), true));

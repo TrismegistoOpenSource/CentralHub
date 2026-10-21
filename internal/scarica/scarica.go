@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"centralhub/internal/github"
 )
@@ -67,7 +68,18 @@ type Risultato struct {
 	Cartella    string // la sottocartella della release
 	GiaPresente bool
 	File        []string
+	// Verificati sono i pacchetti controllati contro il loro SHA-256
+	// (digest di GitHub o SHA256SUMS.txt); NonVerificati i pacchetti per cui
+	// la release non pubblica nessuna somma. Gli archivi dei sorgenti non
+	// hanno somma e non compaiono in nessuno dei due.
+	Verificati    []string
+	NonVerificati []string
 }
+
+// nomeSommeArchivio è il file nascosto in cui l'archiviazione annota le somme
+// con cui ha verificato i pacchetti: serve a controllarli di nuovo quando si
+// installa dall'archivio, anche se la release non pubblica un SHA256SUMS.txt.
+const nomeSommeArchivio = ".centralhub-sha256.txt"
 
 // sorgente è un file da scaricare.
 type sorgente struct {
@@ -135,9 +147,10 @@ func Scarica(ctx context.Context, c *github.Client, repo string, r *github.Relea
 		return Risultato{}, fmt.Errorf("non si può scrivere in %s: %w", cartella, err)
 	}
 	// nella cartella provvisoria si tengono solo i file di questa release
-	voluti := map[string]bool{}
+	voluti := map[string]bool{nomeSommeArchivio: true}
 	for _, s := range elenco {
 		voluti[s.nome] = true
+		voluti[filepath.Base(parte(s.nome))] = true
 	}
 	if voci, err := os.ReadDir(tmp); err == nil {
 		for _, v := range voci {
@@ -167,10 +180,27 @@ func Scarica(ctx context.Context, c *github.Client, repo string, r *github.Relea
 		}
 		nomi = append(nomi, s.nome)
 	}
+	var verificati, nonVerificati []string
+	var righe strings.Builder
+	for _, s := range elenco {
+		if !s.asset {
+			continue
+		}
+		if somma, si := strings.CutPrefix(strings.ToLower(s.digest), "sha256:"); si {
+			verificati = append(verificati, s.nome)
+			righe.WriteString(somma + "  " + s.nome + "\n")
+		} else {
+			nonVerificati = append(nonVerificati, s.nome)
+		}
+	}
+	if righe.Len() > 0 {
+		// non è un motivo per fallire: il file serve solo a controllare di nuovo
+		_ = os.WriteFile(filepath.Join(tmp, nomeSommeArchivio), []byte(righe.String()), 0o644)
+	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return Risultato{}, err
 	}
-	return Risultato{Cartella: dest, File: nomi}, nil
+	return Risultato{Cartella: dest, File: nomi, Verificati: verificati, NonVerificati: nonVerificati}, nil
 }
 
 // giaIntero dice se un file rimasto da un tentativo precedente è quello
@@ -186,66 +216,208 @@ func giaIntero(percorso string, s sorgente) bool {
 	if !si {
 		return true
 	}
-	f, err := os.Open(percorso)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return false
-	}
-	return hex.EncodeToString(h.Sum(nil)) == atteso
+	got, err := sommaFile(percorso)
+	return err == nil && got == atteso
 }
 
-// TenutiDaParte dice quanti file di una release sono rimasti nella cartella
-// provvisoria dopo un download non finito.
+// TenutiDaParte dice quanti file interi di una release sono rimasti nella
+// cartella provvisoria dopo un download non finito (senza quello rimasto a
+// metà, ".part", da cui si riprende comunque).
 func TenutiDaParte(cartella, tag string) int {
 	voci, err := os.ReadDir(parziale(cartella, tag))
 	if err != nil {
 		return 0
 	}
-	return len(voci)
+	n := 0
+	for _, v := range voci {
+		if !strings.HasSuffix(v.Name(), ".part") && !strings.HasPrefix(v.Name(), ".") {
+			n++
+		}
+	}
+	return n
 }
 
+// ErrSenzaSomma: di un pacchetto da installare non c'è nessuna somma di
+// controllo pubblicata. Un file che nessuna somma garantisce non si installa.
+var ErrSenzaSomma = errors.New("la release non pubblica nessuna somma di controllo per questo file (né il digest di GitHub né un SHA256SUMS.txt): per sicurezza non lo installo")
+
+// nonCorrisponde: il file scaricato ha un SHA-256 diverso da quello
+// pubblicato.
+type nonCorrisponde struct{ ottenuto, atteso string }
+
+func (e *nonCorrisponde) Error() string {
+	return fmt.Sprintf("il file scaricato non corrisponde a quello pubblicato (SHA-256 %s, atteso %s)", e.ottenuto, e.atteso)
+}
+
+// parte è il file in cui si tiene un download non finito.
+func parte(percorso string) string { return percorso + ".part" }
+
+// Attese fra un tentativo e l'altro quando la connessione cade: raddoppiano
+// fino al massimo; dopo tanti tentativi di fila senza un byte in più il
+// download si ferma, tenendo ciò che ha (si riprende da lì).
+var (
+	attesaIniziale = 2 * time.Second
+	attesaMassima  = 30 * time.Second
+)
+
+const maxSenzaProgressi = 8
+
+// unFile scarica un file in percorso. Un download interrotto o caduto
+// riprende dal punto in cui era (richiesta Range) e non si butta mai ciò che
+// è già arrivato; se alla fine la somma non torna lo si riscarica una volta
+// da zero.
 func unFile(ctx context.Context, c *github.Client, repo string, s sorgente, percorso string, av Avanzamento) error {
-	var corpo io.ReadCloser
-	var lunghezza int64
 	var err error
-	if s.web {
-		corpo, lunghezza, err = c.ApriWeb(ctx, s.indirizzo)
+	for giro := 0; giro < 2; giro++ {
+		if err = riprendi(ctx, c, repo, s, percorso, av); err == nil {
+			return nil
+		}
+		var nc *nonCorrisponde
+		if !errors.As(err, &nc) {
+			break
+		}
+		os.Remove(parte(percorso)) // un file che non corrisponde non si tiene mai
+	}
+	return err
+}
+
+// riprendeAMeta dice se di questo file si sa la lunghezza, e quindi si può
+// riprendere: gli archivi dei sorgenti non hanno né dimensione né Range
+// affidabile.
+func riprendeAMeta(s sorgente) bool { return s.dimensione > 0 }
+
+func apri(ctx context.Context, c *github.Client, repo string, s sorgente, da int64) (*github.Pezzo, error) {
+	if !s.asset && !s.web {
+		corpo, n, err := c.Apri(ctx, s.indirizzo, repo, false)
+		if err != nil {
+			return nil, err
+		}
+		return &github.Pezzo{Corpo: corpo, Totale: n}, nil
+	}
+	return c.ApriDa(ctx, s.indirizzo, repo, s.web, da)
+}
+
+// transitorio dice se vale la pena riprovare dopo questo errore: la
+// connessione che cade sì; un 404, un token rifiutato o il limite di
+// richieste no.
+func transitorio(err error) bool {
+	var ge *github.Errore
+	if errors.As(err, &ge) {
+		return ge.Tipo == "rete"
+	}
+	return true
+}
+
+func riprendi(ctx context.Context, c *github.Client, repo string, s sorgente, percorso string, av Avanzamento) error {
+	p := parte(percorso)
+	attesa := attesaIniziale
+	senzaProgressi := 0
+	for {
+		var da int64
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+			da = fi.Size()
+		}
+		if !riprendeAMeta(s) || da > s.dimensione {
+			os.Remove(p)
+			da = 0
+		}
+		if da < s.dimensione || s.dimensione <= 0 {
+			pezzo, err := apri(ctx, c, repo, s, da)
+			if err == nil {
+				err = copiaPezzo(ctx, pezzo, p, da, s, av)
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err() // il parziale resta: si riprende da lì
+				}
+				var ge *github.Errore
+				if errors.As(err, &ge) && ge.Tipo == "intervallo" {
+					os.Remove(p)
+					continue
+				}
+				if !transitorio(err) {
+					return err
+				}
+				fi, _ := os.Stat(p)
+				if fi != nil && fi.Size() > da {
+					senzaProgressi, attesa = 0, attesaIniziale
+				} else if senzaProgressi++; senzaProgressi >= maxSenzaProgressi {
+					return fmt.Errorf("download interrotto, ciò che è arrivato è tenuto da parte per riprendere: %w", err)
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(attesa):
+				}
+				if attesa *= 2; attesa > attesaMassima {
+					attesa = attesaMassima
+				}
+				continue
+			}
+		}
+		break
+	}
+	// finito: dimensione, somma, e solo allora il nome vero
+	fi, err := os.Stat(p)
+	if err != nil {
+		return err
+	}
+	if s.dimensione > 0 && fi.Size() != s.dimensione {
+		os.Remove(p)
+		return fmt.Errorf("file incompleto: %d byte su %d", fi.Size(), s.dimensione)
+	}
+	if atteso, si := strings.CutPrefix(strings.ToLower(s.digest), "sha256:"); si {
+		got, err := sommaFile(p)
+		if err != nil {
+			return err
+		}
+		if got != atteso {
+			return &nonCorrisponde{got, atteso}
+		}
+	}
+	return os.Rename(p, percorso)
+}
+
+// copiaPezzo accoda il corpo di pezzo al file parziale, che contiene già da
+// byte; se il server ha mandato il file intero ricomincia da zero.
+func copiaPezzo(ctx context.Context, pezzo *github.Pezzo, p string, da int64, s sorgente, av Avanzamento) error {
+	defer pezzo.Corpo.Close()
+	flag := os.O_WRONLY | os.O_CREATE
+	if pezzo.Inizio == 0 {
+		flag |= os.O_TRUNC
+		da = 0
 	} else {
-		corpo, lunghezza, err = c.Apri(ctx, s.indirizzo, repo, s.asset)
+		flag |= os.O_APPEND
 	}
+	f, err := os.OpenFile(p, flag, 0o644)
 	if err != nil {
 		return err
 	}
-	defer corpo.Close()
 	totale := s.dimensione
-	if totale <= 0 && lunghezza > 0 {
-		totale = lunghezza
+	if totale <= 0 && pezzo.Totale > 0 {
+		totale = pezzo.Totale
 	}
-	f, err := os.OpenFile(percorso, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), &lettore{r: corpo, ctx: ctx, nome: s.nome, totale: totale, av: av})
+	_, err = io.Copy(f, &lettore{r: pezzo.Corpo, ctx: ctx, nome: s.nome, fatti: da, ultimo: da, totale: totale, av: av})
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		return fmt.Errorf("download interrotto: %w", err)
 	}
-	if s.dimensione > 0 && n != s.dimensione {
-		return fmt.Errorf("file incompleto: %d byte su %d", n, s.dimensione)
-	}
-	if atteso, si := strings.CutPrefix(strings.ToLower(s.digest), "sha256:"); si {
-		if got := hex.EncodeToString(h.Sum(nil)); got != atteso {
-			return fmt.Errorf("il file scaricato non corrisponde a quello pubblicato (SHA-256 %s, atteso %s)", got, atteso)
-		}
-	}
 	return nil
+}
+
+func sommaFile(percorso string) (string, error) {
+	f, err := os.Open(percorso)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // lettore conta i byte, avvisa dell'avanzamento e si ferma se il lavoro
@@ -284,6 +456,9 @@ func Asset(ctx context.Context, c *github.Client, repo string, a github.Asset, c
 	}
 	if err := os.MkdirAll(cartella, 0o700); err != nil {
 		return "", err
+	}
+	if _, si := strings.CutPrefix(strings.ToLower(a.Digest), "sha256:"); !si {
+		return "", fmt.Errorf("%s: %w", n, ErrSenzaSomma)
 	}
 	percorso := filepath.Join(cartella, n)
 	if err := os.Remove(percorso); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -384,4 +559,127 @@ func ConfrontaVersioni(a, b string) int {
 		}
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------- dall'archivio
+
+// FileArchiviato è un file di una release che sta nella cartella d'archivio.
+type FileArchiviato struct {
+	Nome       string
+	Dimensione int64
+}
+
+// FileDellaRelease elenca i file di una release già archiviata (la
+// sottocartella con il nome del tag), senza i nascosti.
+func FileDellaRelease(cartella, cartellaRelease string) []FileArchiviato {
+	voci, err := os.ReadDir(filepath.Join(cartella, cartellaRelease))
+	if err != nil {
+		return nil
+	}
+	var out []FileArchiviato
+	for _, v := range voci {
+		if !v.Type().IsRegular() || strings.HasPrefix(v.Name(), ".") {
+			continue
+		}
+		var dim int64
+		if fi, err := v.Info(); err == nil {
+			dim = fi.Size()
+		}
+		out = append(out, FileArchiviato{v.Name(), dim})
+	}
+	return out
+}
+
+// SommeArchiviate legge il SHA256SUMS.txt che l'archiviazione ha scaricato
+// insieme ai pacchetti, se c'è: nome -> somma.
+func SommeArchiviate(cartella, cartellaRelease string) map[string]string {
+	somme := map[string]string{}
+	// prima quelle annotate dall'archiviazione, poi (che prevalgono) quelle
+	// che la release stessa pubblicava
+	if b, err := os.ReadFile(filepath.Join(cartella, cartellaRelease, nomeSommeArchivio)); err == nil && len(b) <= 1<<20 {
+		for n, s := range github.AnalizzaSomme(string(b)) {
+			somme[n] = s
+		}
+	}
+	for _, f := range FileDellaRelease(cartella, cartellaRelease) {
+		n := strings.ToLower(f.Nome)
+		if n == "sha256sums.txt" || n == "sha256sums" {
+			b, err := os.ReadFile(filepath.Join(cartella, cartellaRelease, f.Nome))
+			if err == nil && len(b) <= 1<<20 {
+				for n, s := range github.AnalizzaSomme(string(b)) {
+					somme[n] = s
+				}
+			}
+		}
+	}
+	return somme
+}
+
+// DallArchivio porta un pacchetto dell'archivio nella cartella di lavoro,
+// perché l'installazione possa consumarlo senza toccare l'archivio. Se si
+// conosce la somma attesa la verifica mentre copia; verificato dice se è
+// successo. Il nome è quello del file, senza percorsi.
+func DallArchivio(ctx context.Context, origine, cartella, sha256atteso string, av Avanzamento) (percorso string, verificato bool, err error) {
+	n, err := nomeFile(filepath.Base(origine))
+	if err != nil {
+		return "", false, err
+	}
+	in, err := os.Open(origine)
+	if err != nil {
+		return "", false, fmt.Errorf("il file dell'archivio non si apre: %w", err)
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", false, fmt.Errorf("%s non è un file dell'archivio", origine)
+	}
+	if err := os.MkdirAll(cartella, 0o700); err != nil {
+		return "", false, err
+	}
+	percorso = filepath.Join(cartella, n)
+	out, err := os.OpenFile(percorso, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o700)
+	if err != nil {
+		return "", false, err
+	}
+	h := sha256.New()
+	_, err = io.Copy(io.MultiWriter(out, h), &lettore{r: in, ctx: ctx, nome: n, totale: fi.Size(), av: av})
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(percorso)
+		return "", false, fmt.Errorf("copia dall'archivio interrotta: %w", err)
+	}
+	if atteso := strings.ToLower(strings.TrimPrefix(strings.ToLower(sha256atteso), "sha256:")); atteso != "" {
+		if got := hex.EncodeToString(h.Sum(nil)); got != atteso {
+			os.Remove(percorso)
+			return "", false, &nonCorrisponde{got, atteso}
+		}
+		verificato = true
+	}
+	return percorso, verificato, nil
+}
+
+// DataRelease è il momento in cui la cartella della release è stata
+// archiviata (la sua data di modifica); zero se non si sa.
+func DataRelease(cartella, cartellaRelease string) time.Time {
+	if fi, err := os.Stat(filepath.Join(cartella, cartellaRelease)); err == nil {
+		return fi.ModTime()
+	}
+	return time.Time{}
+}
+
+// LeggiDallaRelease legge un piccolo file (somme, firma) dalla release
+// archiviata, senza badare alle maiuscole nel nome.
+func LeggiDallaRelease(cartella, cartellaRelease, nome string) ([]byte, bool) {
+	for _, f := range FileDellaRelease(cartella, cartellaRelease) {
+		if strings.EqualFold(f.Nome, nome) {
+			b, err := os.ReadFile(filepath.Join(cartella, cartellaRelease, f.Nome))
+			if err != nil || len(b) > 1<<20 {
+				return nil, false
+			}
+			return b, true
+		}
+	}
+	return nil, false
 }
