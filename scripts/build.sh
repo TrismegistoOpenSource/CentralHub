@@ -55,6 +55,11 @@ build_mac() {
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${bundleid}" "${plist}"
   /usr/libexec/PlistBuddy -c "Set :CFBundleName ${appname}" "${plist}"
   /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${minos}" "${plist}"
+  # Elenco di integrità per l'autoverifica (internal/autoverifica), dentro l'app e PRIMA della firma
+  # (sta tra le risorse sigillate). Non può contenere l'eseguibile né _CodeSignature: la firma li cambia.
+  # Li elenca l'elenco della release, completo (INTEGRITA-macos-*.txt, scripts/pacchetto.sh).
+  bash scripts/integrita-pacchetto.sh genera "${dest}" "${dest}/Contents/Resources/INTEGRITA.txt" \
+    "Contents/MacOS/CentralHub" "Contents/_CodeSignature/"
   # Modificare l'Info.plist invalida la firma di Wails: va rifirmata, altrimenti
   # macOS rifiuta di aprire l'app ("è danneggiata").
   codesign --force --deep --sign - "${dest}" 2>/dev/null

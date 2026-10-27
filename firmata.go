@@ -39,6 +39,10 @@ import (
 
 var proprietariFirmati = []string{"trismegistoopensource"}
 
+// testoMancaFirma sta nei messaggi di rifiuto per una firma assente:
+// firmaComparsa lo cerca per togliere l'esito che non è più vero.
+const testoMancaFirma = "manca SHA256SUMS.txt.sig"
+
 // firmaObbligatoriaDal: le release dei proprietari che firmano, pubblicate da
 // questo giorno in poi, devono essere firmate. La data di pubblicazione la
 // mette GitHub quando la release esce: non si può retrodatare.
@@ -72,6 +76,10 @@ func firmaAttesa(v voce, quando time.Time) bool {
 type esitoFirma struct {
 	Release *github.Release   // con i digest delle somme firmate, se firmata
 	Somme   map[string]string // nil = non firmata
+	// Grezzo e Firma sono il testo di SHA256SUMS.txt e la firma, già
+	// verificati (se firmata): servono a completare un archivio.
+	Grezzo []byte
+	Firma  string
 }
 
 func (e esitoFirma) Firmata() bool { return e.Somme != nil }
@@ -87,7 +95,7 @@ func (a *App) verificaRelease(ctx context.Context, v voce, r *github.Release) (e
 	if !firma.Riconosce(sig) {
 		if firmaAttesa(v, quando) {
 			if sig == "" {
-				return esitoFirma{}, errors.New("la release non è firmata (manca SHA256SUMS.txt.sig) e per questo repository la firma è obbligatoria: chi pubblica la firma con scripts/firma-release.sh")
+				return esitoFirma{}, errors.New("la release non è firmata (" + testoMancaFirma + ") e per questo repository la firma è obbligatoria: chi pubblica la firma con scripts/firma-release.sh. Se l'ha firmata da poco, premi «Controlla» su questo repository")
 			}
 			return esitoFirma{}, errors.New("il file SHA256SUMS.txt.sig non è nel formato di CentralHub e per questo repository la firma è obbligatoria")
 		}
@@ -108,7 +116,7 @@ func (a *App) verificaRelease(ctx context.Context, v voce, r *github.Release) (e
 		return esitoFirma{}, err
 	}
 	a.ricordaFirma(v)
-	return esitoFirma{Release: rr, Somme: somme}, nil
+	return esitoFirma{Release: rr, Somme: somme, Grezzo: grezzo, Firma: sig}, nil
 }
 
 // ricordaFirma: da quando CentralHub ha visto una release firmata di questo
@@ -141,7 +149,7 @@ func (a *App) firmateDallArchivio(v voce, rel, tagNoto string) (map[string]strin
 	sig := strings.TrimSpace(string(sigB))
 	if !haSig || !firma.Riconosce(sig) {
 		if firmaAttesa(v, scarica.DataRelease(cartella, rel)) {
-			return nil, false, errors.New("nell'archivio la release non è firmata (manca SHA256SUMS.txt.sig) e per questo repository la firma è obbligatoria")
+			return nil, false, errors.New("nell'archivio la release non è firmata (" + testoMancaFirma + ") e per questo repository la firma è obbligatoria. Se ora su GitHub è firmata, premi «Controlla» e poi «Archivia»: l'archivio si completa con la firma")
 		}
 		return nil, false, nil
 	}

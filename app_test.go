@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,11 +56,14 @@ type ambiente struct {
 	// fidata; "altra" = firmata con un'altra chiave; "alterata" = firma giusta
 	// ma le somme sono state cambiate dopo (firma che non torna)
 	firma string
+	// assetFuori: se non vuoto, l'API finta dà al pacchetto questo indirizzo (di un altro host)
+	assetFuori string
 	// pubblicata: data di pubblicazione delle release finte (RFC 3339); vuota = non indicata
 	pubblicata string
 	web        bool // il sito pubblico finto risponde: i repository sono "gratis"
 	// quante richieste ha avuto l'API e quante il sito (la sonda del tag)
 	api, sonda    int
+	conta         sync.Mutex // il server finto riceve richieste in parallelo («Controlla tutti»): protegge api, sonda e visti
 	fatti         map[string][]byte
 	chiaveDiProva ed25519.PrivateKey
 }
@@ -88,7 +92,9 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 		repo := parti[1] + "/" + parti[2]
 		if parti[0] == "web" {
 			// il sito pubblico: /web/<o>/<r>/releases/latest rimanda al tag
+			e.conta.Lock()
 			e.sonda++
+			e.conta.Unlock()
 			if len(parti) == 5 && parti[4] == "latest" {
 				w.Header().Set("Location", "/web/"+repo+"/releases/tag/"+e.tag)
 				w.WriteHeader(http.StatusFound)
@@ -97,13 +103,22 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 			http.NotFound(w, r)
 			return
 		}
-		if parti[0] == "repos" {
+		avuto := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		// un asset della release (forma vera dell'API): /repos/<o>/<r>/releases/assets/<tipo>-<tag>
+		eAsset := parti[0] == "repos" && len(parti) == 6 && parti[3] == "releases" && parti[4] == "assets"
+		e.conta.Lock()
+		if parti[0] == "repos" && !eAsset {
 			e.api++
 		}
-		avuto := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		e.visti[repo] = avuto
+		e.conta.Unlock()
 		if preteso := e.token[repo]; preteso != "" && avuto != preteso {
 			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if eAsset {
+			tipo, tag, _ := strings.Cut(parti[5], "-")
+			e.serviAsset(w, repo, tipo, tag)
 			return
 		}
 		switch parti[0] {
@@ -111,21 +126,24 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 			release := func(tag string) github.Release {
 				b := e.pacchetto(tag)
 				r := github.Release{Tag: tag, Nome: "Release " + tag, Pubblicata: e.pubblicata, Note: "Novità della " + tag, Assets: []github.Asset{
-					{Nome: e.nomeFile, Dimensione: int64(len(b)), URL: e.srv.URL + "/asset/" + repo + "/" + tag},
-					{Nome: "note.txt", Dimensione: 4, URL: e.srv.URL + "/note/" + repo},
+					{Nome: e.nomeFile, Dimensione: int64(len(b)), URL: e.srv.URL + "/repos/" + repo + "/releases/assets/asset-" + tag},
+					{Nome: "note.txt", Dimensione: 4, URL: e.srv.URL + "/repos/" + repo + "/releases/assets/note"},
 				}}
 				switch e.somme {
 				case "", "digest":
 					r.Assets[0].Digest = "sha256:" + sha(b)
 				case "file", "sbagliata":
-					r.Assets = append(r.Assets, github.Asset{Nome: "SHA256SUMS.txt", Dimensione: int64(len(e.testoSomme(tag))), URL: e.srv.URL + "/sums/" + repo + "/" + tag})
+					r.Assets = append(r.Assets, github.Asset{Nome: "SHA256SUMS.txt", Dimensione: int64(len(e.testoSomme(tag))), URL: e.srv.URL + "/repos/" + repo + "/releases/assets/sums-" + tag})
 				}
 				if e.firma != "" {
-					r.Assets = append(r.Assets, github.Asset{Nome: "SHA256SUMS.txt", Dimensione: int64(len(e.testoSomme(tag))), URL: e.srv.URL + "/sums/" + repo + "/" + tag},
-						github.Asset{Nome: "SHA256SUMS.txt.sig", Dimensione: 89, URL: e.srv.URL + "/sig/" + repo + "/" + tag})
+					r.Assets = append(r.Assets, github.Asset{Nome: "SHA256SUMS.txt", Dimensione: int64(len(e.testoSomme(tag))), URL: e.srv.URL + "/repos/" + repo + "/releases/assets/sums-" + tag},
+						github.Asset{Nome: "SHA256SUMS.txt.sig", Dimensione: 89, URL: e.srv.URL + "/repos/" + repo + "/releases/assets/sig-" + tag})
 				}
 				for _, n := range e.extra {
-					r.Assets = append(r.Assets, github.Asset{Nome: n, Dimensione: 4, URL: e.srv.URL + "/note/" + repo})
+					r.Assets = append(r.Assets, github.Asset{Nome: n, Dimensione: 4, URL: e.srv.URL + "/repos/" + repo + "/releases/assets/note"})
+				}
+				if e.assetFuori != "" {
+					r.Assets[0].URL = e.assetFuori
 				}
 				return r
 			}
@@ -141,30 +159,6 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 			bozza := release("v9.9.9")
 			bozza.Bozza = true
 			json.NewEncoder(w).Encode(append(tutte, bozza))
-		case "asset":
-			w.Write(e.pacchetto(parti[3]))
-		case "note":
-			w.Write([]byte("note"))
-		case "sums":
-			w.Write([]byte(e.testoSomme(parti[3])))
-		case "sig":
-			testo := e.testoSomme(parti[3])
-			chiave := e.chiaveDiProva
-			if e.firma == "altra" {
-				_, chiave, _ = firma.Nuova()
-			}
-			sig, _ := firma.Firma(chiave, repo, parti[3], []byte(testo))
-			switch e.firma {
-			case "alterata":
-				// la firma è delle somme vere; quelle servite sono diverse
-				sig, _ = firma.Firma(chiave, repo, parti[3], []byte(strings.Replace(testo, e.nomeFile, "Altro.zip", 1)))
-			case "riusata":
-				// firma vera, ma fatta per un'altra release
-				sig, _ = firma.Firma(chiave, repo, "v0.0.1", []byte(testo))
-			case "estranea":
-				sig = "untrusted comment: firma di minisign\nRWQ..."
-			}
-			w.Write([]byte(sig + "\n"))
 		}
 	}))
 	t.Cleanup(e.srv.Close)
@@ -181,6 +175,37 @@ func nuovoAmbiente(t *testing.T) *ambiente {
 	e.app.carica()
 	e.app.cartelle = installa.Cartelle{Utente: filepath.Join(e.base, "utente"), Sistema: filepath.Join(e.base, "sistema")}
 	return e
+}
+
+// serviAsset risponde a una richiesta di un file della release: l'asset
+// vero e proprio, le note, le somme o la firma (anche difettosa, secondo e.firma).
+func (e *ambiente) serviAsset(w http.ResponseWriter, repo, tipo, tag string) {
+	switch tipo {
+	case "asset":
+		w.Write(e.pacchetto(tag))
+	case "note":
+		w.Write([]byte("note"))
+	case "sums":
+		w.Write([]byte(e.testoSomme(tag)))
+	case "sig":
+		testo := e.testoSomme(tag)
+		chiave := e.chiaveDiProva
+		if e.firma == "altra" {
+			_, chiave, _ = firma.Nuova()
+		}
+		sig, _ := firma.Firma(chiave, repo, tag, []byte(testo))
+		switch e.firma {
+		case "alterata":
+			// la firma è delle somme vere; quelle servite sono diverse
+			sig, _ = firma.Firma(chiave, repo, tag, []byte(strings.Replace(testo, e.nomeFile, "Altro.zip", 1)))
+		case "riusata":
+			// firma vera, ma fatta per un'altra release
+			sig, _ = firma.Firma(chiave, repo, "v0.0.1", []byte(testo))
+		case "estranea":
+			sig = "untrusted comment: firma di minisign\nRWQ..."
+		}
+		w.Write([]byte(sig + "\n"))
+	}
 }
 
 // pacchetto costruisce l'asset installabile su questo sistema, con dentro il

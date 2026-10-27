@@ -85,8 +85,43 @@ avvia_linux() {
   ok "avvio: aperta dopo 8 s, chiusa, nessun processo rimasto ($n nella sessione)"
 }
 
+# integrita <radice> <elenco della release> <elenco nel pacchetto> [identici]:
+# i file del pacchetto, come li riceve l'utente, devono coincidere con gli elenchi
+# di integrità dell'autoverifica (internal/autoverifica) e il controllo deve
+# funzionare in ENTRAMBE le direzioni: un file alterato a mano deve farlo fallire.
+integrita() {
+  local R="$1" asset="$2" locale="$3" identici="${4:-}" f n
+  [ -s "$asset" ] || no "manca $(basename "$asset") in ../build"
+  [ -s "$locale" ] || no "manca l'elenco INTEGRITA.txt nel pacchetto"
+  bash scripts/integrita-pacchetto.sh controlla "$R" "$locale" >/dev/null || no "i file non coincidono con INTEGRITA.txt del pacchetto"
+  bash scripts/integrita-pacchetto.sh controlla "$R" "$asset" >/dev/null || no "i file non coincidono con $(basename "$asset")"
+  if [ "$identici" = identici ]; then
+    cmp -s "$locale" "$asset" || no "INTEGRITA.txt del pacchetto e $(basename "$asset") dovrebbero essere identici"
+  fi
+  f="$(sed -n '1s/^[0-9a-f]\{64\}  //p' "$asset")"
+  [ -n "$f" ] || no "$(basename "$asset") è vuoto"
+  cp "$R/$f" "$U/integrita-originale"
+  printf 'x' >> "$R/$f"
+  if bash scripts/integrita-pacchetto.sh controlla "$R" "$asset" >/dev/null 2>&1; then
+    no "un file alterato ($f) non è stato scoperto dal controllo di integrità"
+  fi
+  cp "$U/integrita-originale" "$R/$f"
+  bash scripts/integrita-pacchetto.sh controlla "$R" "$asset" >/dev/null || no "dopo il ripristino i file non coincidono più"
+  n="$(wc -l < "$asset" | tr -d ' ')"
+  ok "integrità: $n file coincidono con gli elenchi; un file alterato viene scoperto"
+}
+
+# stato_integrita: dopo l'avvio l'app deve aver scritto l'esito della sua autoverifica
+# nella cartella dei dati (la variabile di configurazione dell'app) ed essere «integro»
+stato_integrita() {
+  local f="$U/config/autoverifica-stato.json"
+  [ -s "$f" ] || no "l'app non ha scritto l'esito dell'autoverifica ($f)"
+  grep -q '"esito": "integro' "$f" || no "autoverifica: $(tr -d '\n' < "$f")"
+  ok "autoverifica all'avvio: $(sed -n 's/.*"titolo": "\(.*\)".*/\1/p' "$f")"
+}
+
 verifica_macos() {
-  local terna nome arch bid A p got
+  local terna nome arch bid A p got sis
   for terna in "CentralHub-AppleSilicon:arm64:com.wails.centralhub.arm64" \
                "CentralHub-Intel:x86_64:com.wails.centralhub.intel"; do
     nome="${terna%%:*}"; rest="${terna#*:}"; arch="${rest%%:*}"; bid="${rest##*:}"
@@ -104,8 +139,14 @@ verifica_macos() {
     codesign --verify --deep --strict "$A" || no "firma di $nome"
     ok "$arch, $bid, versione $VERSIONE, firma"
     licenze "$A/Contents/Resources/LICENZE" "$A/Contents/MacOS/CentralHub"
+    case "$arch" in arm64) sis=macos-arm64 ;; *) sis=macos-amd64 ;; esac
+    integrita "$A" "$B/INTEGRITA-$sis.txt" "$A/Contents/Resources/INTEGRITA.txt"
     # l'Intel parte con Rosetta
-    [ "$AVVIO" = 0 ] || avvia "$A/Contents/MacOS/CentralHub"
+    if [ "$AVVIO" = 1 ]; then
+      rm -f "$U/config/autoverifica-stato.json"
+      avvia "$A/Contents/MacOS/CentralHub"
+      stato_integrita
+    fi
   done
 }
 
@@ -123,7 +164,12 @@ verifica_linux() {
   licenze "$R/usr/share/doc/centralhub" "$R/usr/bin/CentralHub"
   if ldd "$R/usr/bin/CentralHub" | grep 'not found'; then no "librerie mancanti"; fi
   ok "librerie"
-  [ "$AVVIO" = 0 ] || avvia_linux "$img" --appimage-extract-and-run
+  integrita "$R" "$B/INTEGRITA-linux-amd64.txt" "$R/INTEGRITA.txt" identici
+  if [ "$AVVIO" = 1 ]; then
+    rm -f "$U/config/autoverifica-stato.json"
+    avvia_linux "$img" --appimage-extract-and-run
+    stato_integrita
+  fi
 }
 
 verifica_windows() {
@@ -137,7 +183,9 @@ verifica_windows() {
   [ "$v" = "$VERSIONE" ] || no "versione dell'exe $v, attesa $VERSIONE"
   ok "exe, versione $v"
   licenze "$W/LICENZE" "$W/CentralHub.exe"
+  integrita "$W" "$B/INTEGRITA-windows-amd64.txt" "$W/INTEGRITA.txt" identici
   if [ "$AVVIO" = 1 ]; then
+    rm -f "$U/config/autoverifica-stato.json"
     # Aperta 8 s, poi chiusa come la chiude l'utente (WM_CLOSE alla finestra,
     # così passa da OnShutdown); poi nessun processo del suo albero (figli
     # WebView2 compresi) deve restare vivo.
@@ -163,6 +211,7 @@ PS1
     r="$(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$U/avvio.ps1")" "$wexe" | tr -d '\r')"
     [[ "$r" == "ok "* ]] || no "avvio: $r"
     ok "avvio: aperta dopo 8 s, chiusa dalla finestra, nessun processo rimasto (${r#ok } nell'albero)"
+    stato_integrita
   fi
 }
 

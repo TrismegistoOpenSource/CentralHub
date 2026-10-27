@@ -11,6 +11,7 @@
 package scarica
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"centralhub/internal/firma"
 	"centralhub/internal/github"
 )
 
@@ -559,6 +561,77 @@ func ConfrontaVersioni(a, b string) int {
 		}
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------- firma di una release già archiviata
+
+// NomeSomme è il nome con cui si salvano le somme firmate di una release.
+const NomeSomme = "SHA256SUMS.txt"
+
+// CompletaFirma aggiunge a una release già archiviata i due file che la
+// firmano e che allora non c'erano: chi pubblica carica SHA256SUMS.txt.sig
+// dopo il run di Actions, quindi una release archiviata nel frattempo l'ha
+// senza, Scarica non rifà una release già presente, e senza la firma
+// l'installazione dall'archivio si rifiuta. somme e sig sono quelli che la
+// chiamante ha già verificato con le chiavi di CentralHub; si scrivono solo se
+// mancano o sono diversi (le somme firmate valgono più di quelle archiviate:
+// se un pacchetto non torna, l'installazione lo dice). Restituisce i nomi dei
+// file scritti, nessuno se l'archivio era già completo.
+func CompletaFirma(cartella, tag string, somme []byte, sig string) ([]string, error) {
+	rel := NomeCartella(tag)
+	if !Presente(cartella, rel) {
+		return nil, fmt.Errorf("la release %s non è nell'archivio", tag)
+	}
+	var scritti []string
+	metti := func(nome string, contenuto []byte, uguali func(a, b []byte) bool) error {
+		dest := filepath.Join(cartella, rel, nome)
+		for _, f := range FileDellaRelease(cartella, rel) {
+			if strings.EqualFold(f.Nome, nome) {
+				// c'è già, magari con le maiuscole diverse: si riscrive quello
+				dest = filepath.Join(cartella, rel, f.Nome)
+				if b, err := os.ReadFile(dest); err == nil && uguali(b, contenuto) {
+					return nil
+				}
+			}
+		}
+		if err := scriviAtomico(dest, contenuto); err != nil {
+			return fmt.Errorf("%s non si è scritto nell'archivio: %w", filepath.Base(dest), err)
+		}
+		scritti = append(scritti, filepath.Base(dest))
+		return nil
+	}
+	// prima le somme, poi la firma: non resta mai una firma senza le somme che firma
+	if err := metti(NomeSomme, somme, bytes.Equal); err != nil {
+		return scritti, err
+	}
+	err := metti(firma.NomeFile, []byte(strings.TrimSpace(sig)+"\n"), func(a, b []byte) bool {
+		return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
+	})
+	return scritti, err
+}
+
+// scriviAtomico scrive un file piccolo nella sua cartella senza mai lasciarlo
+// a metà: prima un file nascosto accanto, poi la rinomina.
+func scriviAtomico(dest string, contenuto []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".completa-*")
+	if err != nil {
+		return err
+	}
+	nome := tmp.Name()
+	_, err = tmp.Write(contenuto)
+	if e := tmp.Close(); err == nil {
+		err = e
+	}
+	if err == nil {
+		err = os.Chmod(nome, 0o644)
+	}
+	if err == nil {
+		err = os.Rename(nome, dest)
+	}
+	if err != nil {
+		os.Remove(nome)
+	}
+	return err
 }
 
 // ---------------------------------------------------------------- dall'archivio

@@ -49,6 +49,9 @@ type App struct {
 	// basiDati: dove si cercano le impostazioni di un programma da disinstallare
 	basiDati []string
 
+	// esito del controllo che CentralHub fa su sé stesso all'avvio (autoverifica.go)
+	autocontrollo autocontrollo
+
 	// sostituibili nelle prove
 	nuovoCli func(token string) *github.Client
 	cestina  func(goos, percorso string) error // nil = il cestino del sistema
@@ -816,12 +819,41 @@ func (a *App) gratis(v voce) bool {
 // repository usa la propria chiave; un privato senza chiave si prova lo
 // stesso, anonimo (se è diventato pubblico funziona).
 func (a *App) controlla(ctx context.Context, v voce) (*github.Release, error) {
+	return a.controllaConTasto(ctx, v, false)
+}
+
+// controllaDaTasto è il controllo dei tasti «Controlla» (quello della scheda e
+// quello generale): come controlla, ma una release ricordata senza firma, in un
+// repository in cui la firma è attesa, si rilegge da GitHub anche se l'elenco
+// è recente. Chi pubblica carica la firma dopo il run di Actions: un controllo
+// fatto in mezzo ricorda la release senza SHA256SUMS.txt.sig e per 24 ore la
+// riusa, mentre su GitHub la firma ormai c'è. Si rifanno solo i repository in
+// questo caso: gli altri restano sull'elenco in cache.
+func (a *App) controllaDaTasto(ctx context.Context, v voce) (*github.Release, error) {
+	return a.controllaConTasto(ctx, v, true)
+}
+
+// firmaDaRiverificare dice se una release ricordata potrebbe essere stata
+// firmata dopo che la si è guardata: non ha il file di firma e per quel
+// repository la firma è attesa.
+func firmaDaRiverificare(v voce, r *github.Release) bool {
+	if r == nil {
+		return false
+	}
+	if _, c := r.FileFirma(); c {
+		return false
+	}
+	quando, _ := time.Parse(time.RFC3339, r.Pubblicata)
+	return firmaAttesa(v, quando)
+}
+
+func (a *App) controllaConTasto(ctx context.Context, v voce, daTasto bool) (*github.Release, error) {
 	cli := a.nuovoCli(v.token)
 	if cli.Web() != "" && !v.senzaChiave() {
 		if tag, err := cli.TagPubblico(ctx, v.Repo); err == nil {
 			a.mu.Lock()
 			noto, preso := a.ultime[v.ID], a.prese[v.ID]
-			if noto != nil && noto.Tag == tag && time.Since(preso) < validitaElenco {
+			if noto != nil && noto.Tag == tag && time.Since(preso) < validitaElenco && !(daTasto && firmaDaRiverificare(v, noto)) && cli.IndirizziLeciti(v.Repo, noto) {
 				a.visteIl[v.ID] = time.Now()
 				delete(a.errori, v.ID)
 				a.salvaUltime()
@@ -849,14 +881,37 @@ func (a *App) controlla(ctx context.Context, v voce) (*github.Release, error) {
 		if len(r.Note) > maxNote {
 			r.Note = r.Note[:maxNote]
 		}
+		prima := a.ultime[v.ID]
 		a.ultime[v.ID] = r
 		a.visteIl[v.ID] = time.Now()
 		a.prese[v.ID] = time.Now()
 		delete(a.errori, v.ID)
 		a.salvaUltime()
+		if prima != nil && prima.Tag == r.Tag && firmaDaRiverificare(v, prima) && !firmaDaRiverificare(v, r) {
+			a.firmaComparsa(v, r)
+		}
 	}
 	a.mu.Unlock()
 	return r, err
+}
+
+// firmaComparsa: la firma di una release è stata caricata dopo l'ultima volta
+// che la si era guardata. Un lavoro fallito per «manca la firma» non è più
+// vero: il suo esito si toglie, così la scheda non resta rossa per una
+// ragione che non c'è più. Va chiamata con il lucchetto.
+func (a *App) firmaComparsa(v voce, r *github.Release) {
+	tolto := false
+	for _, modo := range []string{modoUpdate, modoArchivio} {
+		k := v.ID + "|" + modo
+		if e, ok := a.esiti[k]; ok && !e.OK && e.Tag == r.Tag && strings.Contains(e.Messaggio, testoMancaFirma) {
+			delete(a.esiti, k)
+			tolto = true
+		}
+	}
+	if tolto {
+		_ = config.SalvaEsiti(a.esiti)
+	}
+	go a.log(v.Nome + ": la firma di " + r.Tag + " è stata pubblicata dopo l'ultimo controllo")
 }
 
 // ultima restituisce l'ultima release per un lavoro (installare, aggiornare,
@@ -866,14 +921,24 @@ func (a *App) ultima(ctx context.Context, v voce) (*github.Release, error) {
 	a.mu.Lock()
 	r, quando := a.ultime[v.ID], a.visteIl[v.ID]
 	a.mu.Unlock()
-	if r != nil && time.Since(quando) < scorciatoia {
+	// una release ricordata con indirizzi fuori posto (ultime.json alterato) non si riusa
+	if r != nil && time.Since(quando) < scorciatoia && a.nuovoCli(v.token).IndirizziLeciti(v.Repo, r) {
 		return r, nil
 	}
 	return a.controlla(ctx, v)
 }
 
-// Controlla guarda se c'è una release nuova per un repository.
+// Controlla guarda se c'è una release nuova per un repository. È il tasto
+// «Controlla» (anche quello generale, ControllaTutti lo chiama per ognuno):
+// rilegge da GitHub anche le release ricordate senza firma (controllaDaTasto).
 func (a *App) Controlla(id string) {
+	a.avviaControllo(id, true)
+}
+
+// avviaControllo lancia il controllo di un repository. daTasto dice se l'ha
+// chiesto l'utente (controllaDaTasto) o se è il controllo automatico
+// dell'apertura (controlla).
+func (a *App) avviaControllo(id string, daTasto bool) {
 	a.mu.Lock()
 	v, ok := a.voce(id)
 	a.mu.Unlock()
@@ -887,7 +952,11 @@ func (a *App) Controlla(id string) {
 	a.avvisa(id)
 	go func() {
 		defer a.finisci(id)
-		if _, err := a.controlla(ctx, v); err != nil && ctx.Err() == nil {
+		controllo := a.controlla
+		if daTasto {
+			controllo = a.controllaDaTasto
+		}
+		if _, err := controllo(ctx, v); err != nil && ctx.Err() == nil {
 			a.log(v.Nome + ": " + err.Error())
 		}
 	}()
@@ -917,7 +986,7 @@ func (a *App) ControllaAllApertura() bool {
 	}
 	a.mu.Unlock()
 	for _, v := range scelti {
-		a.Controlla(v.ID)
+		a.avviaControllo(v.ID, false)
 	}
 	return len(scelti) > 0
 }
@@ -1076,6 +1145,18 @@ func (a *App) archivia(ctx context.Context, v voce) {
 	messaggio := fmt.Sprintf("Release %s archiviata (%d file)", r.Tag, len(ris.File))
 	if ris.GiaPresente {
 		messaggio = "Release " + r.Tag + " già archiviata"
+		// archiviata prima che la si firmasse: Scarica non la rifà, e senza la
+		// firma l'installazione dall'archivio si rifiuta
+		if fr.Firmata() {
+			scritti, err := scarica.CompletaFirma(v.CartellaArchivio, r.Tag, fr.Grezzo, fr.Firma)
+			if err != nil {
+				a.fallito(ctx, v, modoArchivio, r.Tag, fmt.Errorf("la release è nell'archivio ma non si è potuta completare con la firma: %w", err))
+				return
+			}
+			if len(scritti) > 0 {
+				messaggio += "; aggiunta la firma (" + strings.Join(scritti, ", ") + ")"
+			}
+		}
 	} else {
 		messaggio += fmt.Sprintf(", %d pacchetti verificati con SHA-256", len(ris.Verificati))
 		if n := len(ris.NonVerificati); n > 0 {

@@ -788,6 +788,22 @@ document.addEventListener("keydown", (e) => {
 window.addEventListener("dragover", (e) => e.preventDefault());
 window.addEventListener("drop", (e) => e.preventDefault());
 
+// Autoverifica di CentralHub (internal/autoverifica): parte dopo il primo disegno
+// e non blocca niente. Se i file sono diversi dall'originale compare anche un avviso.
+async function mostraAutoverifica() {
+  try {
+    const s = await api().AutoverificaProgramma();
+    const el = $("integrita");
+    el.textContent = s.titolo;
+    el.title = s.dettaglio || s.titolo;
+    el.dataset.esito = s.esito;
+    el.hidden = false;
+    if (s.esito === "diversi" || s.esito === "firma_non_valida") {
+      barra(s.titolo + ". " + (s.dettaglio || ""), true);
+    }
+  } catch (e) { /* nessuna riga: verifica non disponibile */ }
+}
+
 // ---- avvio ---------------------------------------------------------------------
 
 async function avvia() {
@@ -798,6 +814,7 @@ async function avvia() {
   // di più di un'ora fa (quelli pubblici sempre: il sito non conta); «Controlla» lo fa sempre.
   api().ControllaAllApertura();
   api().VerificaIntegrita();
+  setTimeout(mostraAutoverifica, 600);
 }
 
 avvia().catch((e) => barra("Avvio non riuscito: " + messaggio(e), true));

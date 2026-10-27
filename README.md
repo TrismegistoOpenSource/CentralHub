@@ -1,4 +1,4 @@
-# CentralHub 0.2.2
+# CentralHub 0.2.3
 
 Tiene in ordine i programmi che arrivano da repository GitHub: **archivia**
 le loro release e li **installa e aggiorna** sul computer. Scritto in Go +

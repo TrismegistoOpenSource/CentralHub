@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -257,6 +258,9 @@ func (c *Client) Elenco(ctx context.Context, repo string) ([]Release, error) {
 // Apri apre in lettura un indirizzo dell'API (un asset, o l'archivio dei
 // sorgenti). Chi chiama chiude il corpo. La dimensione è -1 se ignota.
 func (c *Client) Apri(ctx context.Context, indirizzo, repo string, asset bool) (io.ReadCloser, int64, error) {
+	if err := c.controllaIndirizzo(indirizzo, repo, false); err != nil {
+		return nil, -1, err
+	}
 	accept := "application/vnd.github+json"
 	if asset {
 		accept = "application/octet-stream"
@@ -273,9 +277,12 @@ func (c *Client) Apri(ctx context.Context, indirizzo, repo string, asset bool) (
 }
 
 // ApriWeb apre in lettura un file sul sito pubblico (un pacchetto di una
-// release, o l'archivio dei sorgenti di un tag). Niente token e niente
-// intestazioni dell'API. Chi chiama chiude il corpo.
-func (c *Client) ApriWeb(ctx context.Context, indirizzo string) (io.ReadCloser, int64, error) {
+// release, o l'archivio dei sorgenti di un tag) del repository repo. Niente
+// token e niente intestazioni dell'API. Chi chiama chiude il corpo.
+func (c *Client) ApriWeb(ctx context.Context, indirizzo, repo string) (io.ReadCloser, int64, error) {
+	if err := c.controllaIndirizzo(indirizzo, repo, true); err != nil {
+		return nil, -1, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, indirizzo, nil)
 	if err != nil {
 		return nil, -1, err
@@ -302,6 +309,105 @@ func (c *Client) ApriWeb(ctx context.Context, indirizzo string) (io.ReadCloser, 
 		return nil, -1, &Errore{"server", fmt.Sprintf("GitHub ha risposto con l'errore %d", resp.StatusCode)}
 	}
 	return resp.Body, resp.ContentLength, nil
+}
+
+// ---------------------------------------------------------------- indirizzi di download
+
+// Gli indirizzi dei file di una release arrivano dall'API di GitHub o da
+// ultime.json, che sta sul disco dell'utente. Si aprono solo se stanno dove
+// GitHub tiene i file di QUEL repository: così un ultime.json alterato a mano,
+// o una risposta manomessa, non può far scaricare da un altro host né
+// mandargli il token (Apri e ApriDa lo mettono nella richiesta).
+
+// prefissiAPI sono i percorsi, sotto l'API, dei file di un repository.
+func prefissiAPI(repo string) []string {
+	return []string{"/repos/" + repo + "/releases/assets/", "/repos/" + repo + "/zipball/", "/repos/" + repo + "/tarball/"}
+}
+
+// prefissiWeb sono i percorsi, sotto il sito pubblico, dei file di un repository.
+func prefissiWeb(repo string) []string {
+	return []string{"/" + repo + "/releases/download/", "/" + repo + "/archive/refs/tags/"}
+}
+
+// indirizzoLecito dice se indirizzo sta sotto base (stesso schema e stesso
+// host) in uno dei percorsi dati, con qualcosa dopo. Il nome del repository si
+// confronta senza badare alle maiuscole: GitHub le restituisce com'è scritto
+// il repository, la configurazione può averle diverse.
+func indirizzoLecito(base, indirizzo string, prefissi []string) bool {
+	if base == "" || strings.ContainsAny(indirizzo, "\\\r\n") {
+		return false
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	u, err := url.Parse(indirizzo)
+	if err != nil || u.Scheme != b.Scheme || !strings.EqualFold(u.Host, b.Host) || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	// niente «..», «.» o barre doppie: il prefisso giusto non deve poter uscire dalla cartella
+	if u.Path == "" || path.Clean(u.Path) != u.Path {
+		return false
+	}
+	p := strings.ToLower(u.Path)
+	for _, pref := range prefissi {
+		pref = strings.ToLower(strings.TrimRight(b.Path, "/") + pref)
+		if strings.HasPrefix(p, pref) && len(p) > len(pref) {
+			return true
+		}
+	}
+	return false
+}
+
+// controllaIndirizzo rifiuta un indirizzo che non sta fra i file del
+// repository: sull'API se web è falso, sul sito pubblico se è vero.
+func (c *Client) controllaIndirizzo(indirizzo, repo string, web bool) error {
+	base, prefissi := c.Base, prefissiAPI(repo)
+	if web {
+		base, prefissi = c.Web(), prefissiWeb(repo)
+	}
+	if repo == "" || !indirizzoLecito(base, indirizzo, prefissi) {
+		return &Errore{"indirizzo", "un indirizzo della release non è fra i file di " + repo + " su GitHub (" + descriviIndirizzo(indirizzo) + "): per sicurezza non lo apro"}
+	}
+	return nil
+}
+
+// descriviIndirizzo accorcia un indirizzo per un messaggio: l'host e l'inizio del percorso.
+func descriviIndirizzo(indirizzo string) string {
+	u, err := url.Parse(indirizzo)
+	if err != nil || u.Host == "" {
+		return "illeggibile"
+	}
+	p := u.Path
+	if len(p) > 60 {
+		p = p[:60] + "…"
+	}
+	return u.Host + p
+}
+
+// IndirizziLeciti dice se tutti gli indirizzi di download di una release (i
+// file, gli archivi dei sorgenti) stanno fra i file del repository. Serve a
+// non riusare dalla cache una release i cui indirizzi sono stati cambiati.
+func (c *Client) IndirizziLeciti(repo string, r *Release) bool {
+	if r == nil {
+		return false
+	}
+	web := c.Web()
+	for _, a := range r.Assets {
+		if !indirizzoLecito(c.Base, a.URL, prefissiAPI(repo)) {
+			return false
+		}
+		// con un token il sito pubblico non si usa mai (Web() è vuoto): l'indirizzo non conta
+		if web != "" && a.Pubblico != "" && !indirizzoLecito(web, a.Pubblico, prefissiWeb(repo)) {
+			return false
+		}
+	}
+	for _, sorgente := range []string{r.Zipball, r.Tarball} {
+		if sorgente != "" && !indirizzoLecito(c.Base, sorgente, prefissiAPI(repo)) {
+			return false
+		}
+	}
+	return true
 }
 
 // SorgentiWeb restituisce gli indirizzi pubblici degli archivi dei sorgenti
@@ -432,7 +538,7 @@ func (c *Client) piccolo(ctx context.Context, repo string, a Asset) ([]byte, err
 	var corpo io.ReadCloser
 	var err error
 	if c.Web() != "" && a.Pubblico != "" {
-		corpo, _, err = c.ApriWeb(ctx, a.Pubblico)
+		corpo, _, err = c.ApriWeb(ctx, a.Pubblico, repo)
 	} else {
 		corpo, _, err = c.Apri(ctx, a.URL, repo, true)
 	}
@@ -510,6 +616,9 @@ type Pezzo struct {
 // sito pubblico) a partire dal byte da. Serve a riprendere un download
 // interrotto invece di ricominciarlo.
 func (c *Client) ApriDa(ctx context.Context, indirizzo, repo string, web bool, da int64) (*Pezzo, error) {
+	if err := c.controllaIndirizzo(indirizzo, repo, web); err != nil {
+		return nil, err
+	}
 	var resp *http.Response
 	var err error
 	if web {

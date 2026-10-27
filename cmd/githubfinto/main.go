@@ -54,7 +54,7 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.Path)
 		parti := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		// repos/<proprietario>/<repo>/… e file/<proprietario>/<repo>/…
+		// repos/<proprietario>/<repo>/… (anche i file: …/releases/assets/<tag>/<nome>)
 		if len(parti) >= 3 {
 			for _, p := range strings.Split(*privati, ",") {
 				atteso := "Bearer github_pat_" + *segreto + "_" + strings.ToLower(parti[2])
@@ -98,7 +98,7 @@ func main() {
 					if fi, err := v.Info(); err == nil && !v.IsDir() && !strings.HasPrefix(v.Name(), ".") {
 						// come GitHub, che dà il digest di ogni file: senza, CentralHub non installa
 						rel.Assets = append(rel.Assets, github.Asset{Nome: v.Name(), Dimensione: fi.Size(), Digest: sommaDi(filepath.Join(dir, t, v.Name())),
-							URL: base + "/file/" + parti[1] + "/" + parti[2] + "/" + t + "/" + v.Name()})
+							URL: base + "/repos/" + parti[1] + "/" + parti[2] + "/releases/assets/" + t + "/" + v.Name()})
 					}
 				}
 				tutte = append(tutte, rel)
@@ -108,9 +108,9 @@ func main() {
 			} else {
 				json.NewEncoder(w).Encode(tutte)
 			}
-		// /file/<proprietario>/<repo>/<tag>/<nome>
-		case len(parti) == 5 && parti[0] == "file":
-			f, err := os.Open(filepath.Join(*radice, parti[1], parti[2], parti[3], filepath.Base(parti[4])))
+		// /repos/<proprietario>/<repo>/releases/assets/<tag>/<nome>: come l'API vera, l'indirizzo sta sotto il repository
+		case len(parti) == 7 && parti[0] == "repos" && parti[3] == "releases" && parti[4] == "assets":
+			f, err := os.Open(filepath.Join(*radice, parti[1], parti[2], parti[5], filepath.Base(parti[6])))
 			if err != nil {
 				http.NotFound(w, r)
 				return

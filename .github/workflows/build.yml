@@ -37,7 +37,10 @@ jobs:
         include:
           - os: macos-latest
             nome: macOS
-          - os: ubuntu-latest
+          # ubuntu-24.04 fisso, non ubuntu-latest: dal 23/10/2026 «latest» è 26.04, più nuova di
+          # Debian 13, e l'AppImage pretenderebbe librerie che le distribuzioni più vecchie non hanno
+          # (PROBLEMI-NOTI.md §37). Si aggiorna di proposito, dopo averla provata.
+          - os: ubuntu-24.04
             nome: Linux
           - os: windows-latest
             nome: Windows
@@ -52,7 +55,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Pacchetti di sviluppo Linux
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.nome == 'Linux'
         # apt-get update tollerato: i repo di terze parti dei runner a volte
         # falliscono; il cancello vero è apt-get install (PROBLEMI-NOTI.md §9).
         run: |
@@ -74,10 +77,10 @@ jobs:
         run: |
           set -e
           source scripts/progetto.conf
-          case "${{ matrix.os }}" in
-            macos-latest) a="$ARTEFATTI_macos" ;;
-            ubuntu-latest) a="$ARTEFATTI_linux" ;;
-            windows-latest) a="$ARTEFATTI_windows" ;;
+          case "${{ matrix.nome }}" in
+            macOS) a="$ARTEFATTI_macos" ;;
+            Linux) a="$ARTEFATTI_linux" ;;
+            Windows) a="$ARTEFATTI_windows" ;;
           esac
           mkdir -p dist
           for f in $a; do cp "../build/$f" dist/; done

@@ -55,6 +55,10 @@ func nuovoFinto(t *testing.T) *finto {
 			f.tokenFuori.Store(true)
 		}
 		nome := strings.TrimPrefix(r.URL.Path, "/")
+		// l'indirizzo pubblico di un file di una release: <o>/<r>/releases/download/<tag>/<nome>
+		if p := strings.SplitN(nome, "/", 6); len(p) == 6 && p[2] == "releases" && p[3] == "download" {
+			nome = p[5]
+		}
 		// gli indirizzi pubblici degli archivi dei sorgenti
 		switch {
 		case strings.HasSuffix(nome, "/archive/refs/tags/v1.2.0.zip"):
@@ -106,6 +110,7 @@ func nuovoFinto(t *testing.T) *finto {
 		}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
+			repo := strings.Join(strings.Split(strings.Trim(r.URL.Path, "/"), "/")[1:3], "/") // /repos/<o>/<r>/releases/latest
 			if f.stato != 0 {
 				for k, v := range f.intestazioni {
 					w.Header().Set(k, v)
@@ -115,7 +120,7 @@ func nuovoFinto(t *testing.T) *finto {
 				return
 			}
 			rel := github.Release{Tag: "v1.2.0", Nome: "Versione 1.2.0",
-				Zipball: f.api.URL + "/sorgente/zip", Tarball: f.api.URL + "/sorgente/tar"}
+				Zipball: f.api.URL + "/repos/" + repo + "/zipball/v1.2.0", Tarball: f.api.URL + "/repos/" + repo + "/tarball/v1.2.0"}
 			// in ordine di nome: l'ordine di una mappa cambierebbe da una prova all'altra
 			nomi := make([]string, 0, len(f.contenuti))
 			for nome := range f.contenuti {
@@ -128,20 +133,22 @@ func nuovoFinto(t *testing.T) *finto {
 					continue
 				}
 				rel.Assets = append(rel.Assets, github.Asset{Nome: nome, Dimensione: int64(len(b)),
-					URL: f.api.URL + "/asset/" + nome, Digest: f.digest[nome], Pubblico: f.storage.URL + "/" + nome})
+					URL: f.api.URL + "/repos/" + repo + "/releases/assets/" + nome, Digest: f.digest[nome],
+					Pubblico: f.storage.URL + "/" + repo + "/releases/download/v1.2.0/" + nome})
 			}
 			json.NewEncoder(w).Encode(rel)
-		case strings.HasPrefix(r.URL.Path, "/asset/"):
+		case strings.Contains(r.URL.Path, "/releases/assets/"):
 			f.apiAsset.Add(1)
 			if r.Header.Get("Accept") != "application/octet-stream" {
 				http.Error(w, "serve Accept: application/octet-stream", http.StatusBadRequest)
 				return
 			}
-			http.Redirect(w, r, f.storage.URL+"/"+strings.TrimPrefix(r.URL.Path, "/asset/"), http.StatusFound)
-		case r.URL.Path == "/sorgente/zip":
+			_, nome, _ := strings.Cut(r.URL.Path, "/releases/assets/")
+			http.Redirect(w, r, f.storage.URL+"/"+nome, http.StatusFound)
+		case strings.Contains(r.URL.Path, "/zipball/"):
 			f.apiAsset.Add(1)
 			http.Redirect(w, r, f.storage.URL+"/sorgente.zip", http.StatusFound)
-		case r.URL.Path == "/sorgente/tar":
+		case strings.Contains(r.URL.Path, "/tarball/"):
 			f.apiAsset.Add(1)
 			http.Redirect(w, r, f.storage.URL+"/sorgente.tar.gz", http.StatusFound)
 		default:
@@ -570,5 +577,70 @@ func TestVersioniEScaricate(t *testing.T) {
 	}
 	if NomeCartella(" v1.0/beta 2 ") != "v1.0-beta-2" || NomeCartella("../..") != "release" {
 		t.Errorf("NomeCartella: %q %q", NomeCartella(" v1.0/beta 2 "), NomeCartella("../.."))
+	}
+}
+
+func TestCompletaFirma(t *testing.T) {
+	cartella := t.TempDir()
+	somme := []byte(strings.Repeat("a", 64) + "  Prova.zip\n")
+	sig := "c2lnbmF0dXJh"
+
+	// la release non è nell'archivio
+	if _, err := CompletaFirma(cartella, "v1.0.0", somme, sig); err == nil {
+		t.Fatal("senza la cartella della release deve dare errore")
+	}
+
+	rel := filepath.Join(cartella, "v1.0.0")
+	if err := os.MkdirAll(rel, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(rel, "Prova.zip"), []byte("zip"), 0o644)
+
+	// mancano tutti e due: si scrivono, le somme prima della firma
+	scritti, err := CompletaFirma(cartella, "v1.0.0", somme, sig)
+	if err != nil || len(scritti) != 2 || scritti[0] != "SHA256SUMS.txt" || scritti[1] != "SHA256SUMS.txt.sig" {
+		t.Fatalf("scritti %v, errore %v", scritti, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rel, "SHA256SUMS.txt")); string(b) != string(somme) {
+		t.Errorf("somme scritte male: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rel, "SHA256SUMS.txt.sig")); string(b) != sig+"\n" {
+		t.Errorf("firma scritta male: %q", b)
+	}
+	if b, err := LeggiDallaRelease(cartella, "v1.0.0", "SHA256SUMS.txt.sig"); !err || strings.TrimSpace(string(b)) != sig {
+		t.Errorf("la firma deve poter essere riletta: %q %v", b, err)
+	}
+
+	// già completo (anche con la firma senza a capo): non si riscrive niente
+	os.WriteFile(filepath.Join(rel, "SHA256SUMS.txt.sig"), []byte(sig), 0o644)
+	if scritti, err = CompletaFirma(cartella, "v1.0.0", somme, sig); err != nil || len(scritti) != 0 {
+		t.Errorf("archivio completo: scritti %v, errore %v", scritti, err)
+	}
+
+	// un file con le maiuscole diverse si riscrive con il suo nome, senza doppioni
+	os.Remove(filepath.Join(rel, "SHA256SUMS.txt"))
+	os.Remove(filepath.Join(rel, "SHA256SUMS.txt.sig"))
+	os.WriteFile(filepath.Join(rel, "sha256sums.txt"), []byte("vecchie\n"), 0o644)
+	scritti, err = CompletaFirma(cartella, "v1.0.0", somme, sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nomi []string
+	for _, f := range FileDellaRelease(cartella, "v1.0.0") {
+		nomi = append(nomi, f.Nome)
+	}
+	if len(nomi) != 3 {
+		t.Errorf("file dopo il completamento: %v (scritti %v)", nomi, scritti)
+	}
+	if b, _ := LeggiDallaRelease(cartella, "v1.0.0", "SHA256SUMS.txt"); string(b) != string(somme) {
+		t.Errorf("le somme firmate dovevano sostituire quelle vecchie: %q", b)
+	}
+
+	// nessun file provvisorio rimasto
+	voci, _ := os.ReadDir(rel)
+	for _, v := range voci {
+		if strings.HasPrefix(v.Name(), ".completa-") {
+			t.Errorf("file provvisorio rimasto: %s", v.Name())
+		}
 	}
 }
