@@ -31,22 +31,20 @@ export CENTRALHUB_CONFIG_DIR
 no() { echo "FALLITO: $*"; exit 1; }
 ok() { echo "ok  $*"; }
 
-# licenze <cartella LICENZE> <eseguibile>: i file principali e una licenza per
-# ogni modulo Go che è davvero nel binario (PROBLEMI-NOTI.md §23)
+# licenze <eseguibile>: i testi delle licenze stanno DENTRO il programma (go:embed, internal/licenze): non c'è una cartella di licenze accanto.
+# Si controlla che nel binario ci siano i file principali e una licenza per ogni modulo Go che è davvero nel binario (PROBLEMI-NOTI.md §23).
 licenze() {
-  local L="$1" exe="$2" m
-  for f in LICENSE THIRD-PARTY-LICENSES.md moduli-go/ELENCO.txt moduli-go/go/LICENSE; do
-    [ -s "$L/$f" ] || no "manca LICENZE/$f"
+  local exe="$1" m n=0 base="internal/licenze/testi/raccolta"
+  for f in LICENSE THIRD-PARTY-LICENSES.md licenses/appimage-runtime.txt moduli-go/ELENCO.txt moduli-go/go/LICENSE; do
+    grep -aqF "$base/$f" "$exe" || no "nel programma manca la licenza $f"
   done
   for m in $(go version -m "$exe" | awk '$1=="dep"{print $2}'); do
-    grep -q "^$m@" "$L/moduli-go/ELENCO.txt" || no "nessuna licenza per $m"
+    grep -aqF "$base/moduli-go/$(echo "$m" | tr '/' '_')/" "$exe" || no "nessuna licenza per $m dentro il programma"
+    n=$((n + 1))
   done
-  # Licenze annidate (PROBLEMI-NOTI.md §23): Wails compila codice di altri
-  # autori con licenza propria in sottocartelle; il pacchetto deve portarle.
-  if grep -q '^github.com/wailsapp/wails/v2@' "$L/moduli-go/ELENCO.txt"; then
-    ls -d "$L"/moduli-go/*/annidate >/dev/null 2>&1 || no "nessuna licenza annidata in LICENZE/moduli-go/*/annidate"
-  fi
-  ok "licenze ($(wc -l < "$L/moduli-go/ELENCO.txt" | tr -d ' ') moduli)"
+  # Licenze annidate (PROBLEMI-NOTI.md §23): Wails compila codice di altri autori con licenza propria in sottocartelle.
+  grep -aqF "$base/moduli-go/github.com_wailsapp_wails_v2/annidate/" "$exe" || no "nessuna licenza annidata di Wails dentro il programma"
+  ok "licenze dentro il programma ($n moduli)"
 }
 
 # avvia <comando…>: l'app resta aperta 8 s; poi la si chiude e non deve
@@ -138,7 +136,7 @@ verifica_macos() {
     [ "$got" = "$VERSIONE" ] || no "versione $got, attesa $VERSIONE"
     codesign --verify --deep --strict "$A" || no "firma di $nome"
     ok "$arch, $bid, versione $VERSIONE, firma"
-    licenze "$A/Contents/Resources/LICENZE" "$A/Contents/MacOS/CentralHub"
+    licenze "$A/Contents/MacOS/CentralHub"
     case "$arch" in arm64) sis=macos-arm64 ;; *) sis=macos-amd64 ;; esac
     integrita "$A" "$B/INTEGRITA-$sis.txt" "$A/Contents/Resources/INTEGRITA.txt"
     # l'Intel parte con Rosetta
@@ -161,7 +159,7 @@ verifica_linux() {
     [ -s "$R/$f" ] || no "manca $f nell'AppImage"
   done
   ok "eseguibile, icona, .desktop"
-  licenze "$R/usr/share/doc/centralhub" "$R/usr/bin/CentralHub"
+  licenze "$R/usr/bin/CentralHub"
   if ldd "$R/usr/bin/CentralHub" | grep 'not found'; then no "librerie mancanti"; fi
   ok "librerie"
   integrita "$R" "$B/INTEGRITA-linux-amd64.txt" "$R/INTEGRITA.txt" identici
@@ -182,7 +180,7 @@ verifica_windows() {
   v="$(powershell -NoProfile -Command "\$v=[Diagnostics.FileVersionInfo]::GetVersionInfo('$wexe'); '{0}.{1}.{2}' -f \$v.FileMajorPart,\$v.FileMinorPart,\$v.FileBuildPart" | tr -d '\r')"
   [ "$v" = "$VERSIONE" ] || no "versione dell'exe $v, attesa $VERSIONE"
   ok "exe, versione $v"
-  licenze "$W/LICENZE" "$W/CentralHub.exe"
+  licenze "$W/CentralHub.exe"
   integrita "$W" "$B/INTEGRITA-windows-amd64.txt" "$W/INTEGRITA.txt" identici
   if [ "$AVVIO" = 1 ]; then
     rm -f "$U/config/autoverifica-stato.json"

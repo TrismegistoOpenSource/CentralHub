@@ -30,7 +30,7 @@
         </g>
       </svg>
       <span class="brand-name">CentralHub</span>
-      <span class="brand-version" id="versione"></span>
+      <button class="brand-version" id="versione" type="button" title="Informazioni e licenze"></button>
     </div>
     <div class="titlebar-actions" style="--wails-draggable:no-drag">
       <button class="btn ghost" id="btn-importa" title="Aggiunge alla lista i repository di un file JSON (con le loro chiavi, se il file le contiene)">
@@ -238,6 +238,23 @@
       <pre class="novita-testo" id="nov-testo"></pre>
       <div class="modal-actions">
         <button class="btn primary" id="nov-chiudi">Chiudi</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- licenze: gruppi che si aprono e si chiudono, una riga per componente, testo intero a richiesta -->
+  <div class="modal-overlay" id="dlg-licenze" hidden>
+    <div class="modal licenze-modal">
+      <h2 id="lic-titolo">Licenze</h2>
+      <p class="nota" id="lic-nota"></p>
+      <div class="lic-elenco" id="lic-elenco"></div>
+      <div id="lic-lettura" hidden>
+        <button class="btn ghost" id="lic-indietro" type="button">← Indietro</button>
+        <h3 id="lic-voce"></h3>
+        <pre class="novita-testo" id="lic-testo"></pre>
+      </div>
+      <div class="modal-actions">
+        <button class="btn primary" id="lic-chiudi" type="button">Chiudi</button>
       </div>
     </div>
   </div>

@@ -1,0 +1,4 @@
+Questa cartella raccoglie le licenze che l'app mostra (clic sul numero di versione). Il sottoinsieme `raccolta/`
+NON sta nel sorgente: lo genera scripts/raccogli-licenze.sh a ogni build (build.sh) e a ogni giro di prova
+(ci-locale.sh), e poi lo si toglie. Così le licenze dentro l'app sono sempre quelle delle librerie che
+finiscono davvero nel programma (le prende da go.mod). Una build senza raccolta mostra solo le voci scritte a mano e lo dice.

@@ -571,6 +571,19 @@ func percorsoProcessi(percorso, goos string) string {
 	return percorso
 }
 
+// appConAltroNome dà il percorso dell'app che CentralHub aveva installato per questo programma quando ha un nome diverso da quello
+// della nuova (stessa cartella, estensione .app, ancora presente); altrimenti una stringa vuota.
+func appConAltroNome(cartellaRegistro, nome, cartella, nuovo string) string {
+	prec, ok := leggiRegistro(cartellaRegistro, nome)
+	if !ok || prec.Percorso == "" || !strings.HasSuffix(prec.Percorso, ".app") {
+		return ""
+	}
+	if filepath.Clean(filepath.Dir(prec.Percorso)) != filepath.Clean(cartella) || strings.EqualFold(prec.Percorso, nuovo) || !esiste(prec.Percorso) {
+		return ""
+	}
+	return prec.Percorso
+}
+
 // Installa installa o aggiorna il programma.
 func Installa(r Richiesta) (Esito, error) {
 	if r.GOOS == "" {
@@ -719,8 +732,34 @@ func Installa(r Richiesta) (Esito, error) {
 		if !esito.SeStesso && inEsecuzione(percorsoProcessi(esito.Percorso, r.GOOS), r.GOOS) {
 			return Esito{}, &ErrInEsecuzione{r.Nome}
 		}
+		// Un aggiornamento che cambia il nome dell'app (per esempio da «Nome-AppleSilicon.app» a «Nome.app»): è la stessa app, la vecchia
+		// non deve restare accanto alla nuova. Si tocca solo ciò che CentralHub stesso ha installato (registro), nella stessa cartella.
+		vecchia := appConAltroNome(r.CartellaRegistro, r.Nome, cartella, esito.Percorso)
+		stessa := vecchia != "" && seStesso(vecchia) // CentralHub che aggiorna sé stesso e cambia nome all'app
+		if vecchia != "" && !stessa && inEsecuzione(percorsoProcessi(vecchia, r.GOOS), r.GOOS) {
+			return Esito{}, &ErrInEsecuzione{r.Nome}
+		}
 		if err := scambia(app[0], esito.Percorso); err != nil {
 			return Esito{}, err
+		}
+		switch {
+		case vecchia == "":
+		case stessa:
+			// È l'app che sta girando: non si cancella. Si mette da parte come «.precedente» (macOS lo permette anche se è aperta) e la toglie
+			// il prossimo avvio, dalla nuova (PulisciDopoAggiornamento). Chi riapre il programma deve usare il nome nuovo.
+			esito.SeStesso = true
+			if err := os.RemoveAll(vecchia + suffissoPrecedente); err == nil {
+				err = os.Rename(vecchia, vecchia+suffissoPrecedente)
+				if err == nil {
+					esito.Avvisi = append(esito.Avvisi, "l'app ha cambiato nome: ora è "+filepath.Base(esito.Percorso)+" (riaprila da lì); la vecchia copia, "+filepath.Base(vecchia)+", si toglie da sola al prossimo avvio")
+					break
+				}
+			}
+			esito.Avvisi = append(esito.Avvisi, "l'app ha cambiato nome: ora è "+filepath.Base(esito.Percorso)+"; la vecchia copia ("+filepath.Base(vecchia)+") è in uso e non si è potuta mettere da parte: cancellala a mano dopo averla chiusa")
+		default:
+			if err := os.RemoveAll(vecchia); err != nil {
+				esito.Avvisi = append(esito.Avvisi, "l'app con il vecchio nome ("+filepath.Base(vecchia)+") non si è potuta cancellare: "+err.Error())
+			}
 		}
 	default:
 		return Esito{}, fmt.Errorf("installazione non prevista su %s", r.GOOS)
@@ -1037,7 +1076,18 @@ func PulisciDopoAggiornamento() {
 		}
 	case "darwin":
 		if i := strings.Index(exe, ".app/Contents/MacOS/"); i > 0 {
-			os.RemoveAll(exe[:i+len(".app")] + suffissoPrecedente)
+			app := exe[:i+len(".app")]
+			os.RemoveAll(app + suffissoPrecedente)
+			// l'app può aver cambiato nome nell'aggiornamento («Nome-AppleSilicon.app» → «Nome.app»): la vecchia messa da parte ha lo stesso nome
+			// di base seguito da «-»; si tolgono solo i «.precedente» di quella famiglia, mai quelli di altri programmi.
+			base := strings.TrimSuffix(filepath.Base(app), ".app")
+			voci, _ := os.ReadDir(filepath.Dir(app))
+			for _, v := range voci {
+				n := v.Name()
+				if strings.HasSuffix(n, ".app"+suffissoPrecedente) && strings.HasPrefix(n, base+"-") {
+					os.RemoveAll(filepath.Join(filepath.Dir(app), n))
+				}
+			}
 		}
 	}
 }

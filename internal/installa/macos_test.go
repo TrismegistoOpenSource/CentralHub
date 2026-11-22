@@ -524,3 +524,78 @@ func TestMacSeStessoAggiornaESiPulisce(t *testing.T) {
 		t.Error("la nuova app non c'è più")
 	}
 }
+
+// CentralHub che aggiorna sé stesso cambiando il nome dell'app («Prova-AppleSilicon.app» → «Prova.app»): la vecchia, che sta girando, non si cancella ma
+// si mette da parte; il prossimo avvio, dalla nuova, la toglie. Un'altra app con un nome diverso non si tocca.
+func TestMacSeStessoCambiaNome(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("solo su macOS")
+	}
+	base := os.Getenv("CH_BASE")
+	switch os.Getenv("CH_AIUTO") {
+	case "aggiorna":
+		r := Richiesta{ID: "id1", Nome: "Prova", Repo: "a/Prova", Tag: "v2.0.0", File: os.Getenv("CH_ZIP"), Ambito: Utente,
+			Cartelle:         Cartelle{Utente: filepath.Join(base, "utente"), Sistema: filepath.Join(base, "sistema")},
+			CartellaRegistro: filepath.Join(base, "registro"), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
+		e, err := Installa(r)
+		if err != nil || !e.SeStesso || len(e.Avvisi) != 1 {
+			fmt.Printf("AIUTO-KO: %+v %v\n", e, err)
+			os.Exit(3)
+		}
+		fmt.Println("AIUTO-OK")
+		os.Exit(0)
+	case "pulisci":
+		PulisciDopoAggiornamento()
+		fmt.Println("AIUTO-OK")
+		os.Exit(0)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base = t.TempDir()
+	faiApp := func(cartella, nomeApp, versione string) string {
+		app := filepath.Join(cartella, nomeApp+".app")
+		dest := filepath.Join(app, "Contents", "MacOS", "prova.test")
+		os.MkdirAll(filepath.Dir(dest), 0o755)
+		if err := copia(exe, dest, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		scrivi(t, filepath.Join(app, "Contents", "versione"), versione)
+		return app
+	}
+	utente := filepath.Join(base, "utente")
+	vecchia := faiApp(utente, "Prova-AppleSilicon", "1")
+	altra := faiApp(utente, "Altra-Cosa", "1") // un'altra app, anche con un suo «.precedente»
+	os.Rename(altra, altra+".precedente")
+	nuova := faiApp(filepath.Join(base, "src"), "Prova", "2")
+	zip := filepath.Join(base, "Prova-AppleSilicon.zip")
+	if out, err := exec.Command("/usr/bin/ditto", "-c", "-k", "--keepParent", nuova, zip).CombinedOutput(); err != nil {
+		t.Fatalf("ditto: %v %s", err, out)
+	}
+	// CentralHub sa dov'è installata l'app con il vecchio nome
+	dati := fmt.Sprintf(`{"id":"id1","nome":"Prova","repo":"a/Prova","tag":"v1.0.0","asset":"Prova-AppleSilicon.zip","ambito":%q,"percorso":%q,"tipo":%q}`, Utente, vecchia, TipoApp)
+	scrivi(t, fileRegistro(filepath.Join(base, "registro"), "Prova"), dati)
+	lancia := func(da, aiuto string) {
+		cmd := exec.Command(filepath.Join(da, "Contents", "MacOS", "prova.test"), "-test.run=^TestMacSeStessoCambiaNome$")
+		cmd.Env = append(os.Environ(), "CH_AIUTO="+aiuto, "CH_BASE="+base, "CH_ZIP="+zip)
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "AIUTO-OK") {
+			t.Fatalf("%s: %v\n%s", aiuto, err, out)
+		}
+	}
+	lancia(vecchia, "aggiorna") // è la vecchia app a aggiornare sé stessa
+	if leggi(t, filepath.Join(utente, "Prova.app", "Contents", "versione")) != "2" {
+		t.Fatal("la nuova app non è stata installata")
+	}
+	if esiste(vecchia) || !esiste(vecchia+".precedente") {
+		t.Error("la vecchia app doveva essere messa da parte come .precedente, non cancellata")
+	}
+	lancia(filepath.Join(utente, "Prova.app"), "pulisci") // il riavvio, dalla nuova
+	if esiste(vecchia + ".precedente") {
+		t.Error("il riavvio doveva togliere la vecchia copia")
+	}
+	if !esiste(altra + ".precedente") {
+		t.Error("il «.precedente» di un altro programma non si tocca")
+	}
+}

@@ -1,4 +1,4 @@
-# CentralHub 0.2.3
+# CentralHub 0.2.4
 
 Tiene in ordine i programmi che arrivano da repository GitHub: **archivia**
 le loro release e li **installa e aggiorna** sul computer. Scritto in Go +
@@ -335,8 +335,8 @@ scripts/                   build, pacchetto, verifica, prova locale, release
 usare, copiare, modificare e ridistribuire, anche in programmi commerciali,
 purché resti l'avviso di copyright. I componenti di terze parti e le loro
 licenze (tutte permissive) sono in
-[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md); i testi viaggiano con
-l'app, nella cartella `LICENZE`.
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md); i testi stanno **dentro il
+programma** (nessuna cartella accanto): clic sul numero di versione in alto (su macOS anche dal menu «Informazioni su CentralHub e licenze…»), con un gruppo chiuso per tipo di componente e il testo intero di ogni licenza, senza rete.
 
 Contributi e segnalazioni: [CONTRIBUTING.md](CONTRIBUTING.md). Problemi di
 sicurezza: [SECURITY.md](SECURITY.md).

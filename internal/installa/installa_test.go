@@ -494,3 +494,92 @@ func TestMacInstallaEAggiorna(t *testing.T) {
 		t.Errorf("app messa a mano: %+v", s)
 	}
 }
+
+// Aggiornando da «Prova-AppleSilicon.app» a «Prova.app» (nome pulito) l'app vecchia non resta accanto alla nuova; un'app che non è di CentralHub non si tocca.
+func TestMacCambioNomeDellApp(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("solo su macOS")
+	}
+	p := nuovaProva(t)
+	fai := func(tag, nomeApp string) string {
+		src := filepath.Join(p.base, "src-"+tag, nomeApp+".app")
+		scrivi(t, filepath.Join(src, "Contents", "MacOS", "Prova"), tag)
+		os.Chmod(filepath.Join(src, "Contents", "MacOS", "Prova"), 0o755)
+		scrivi(t, filepath.Join(src, "Contents", "Info.plist"), "<plist><dict><key>CFBundleShortVersionString</key>\n<string>"+tag+"</string></dict></plist>")
+		zip := filepath.Join(p.base, tag, "Prova-AppleSilicon.zip")
+		os.MkdirAll(filepath.Dir(zip), 0o755)
+		if out, err := exec.Command("/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", src, zip).CombinedOutput(); err != nil {
+			t.Fatalf("ditto: %v %s", err, out)
+		}
+		return zip
+	}
+	if _, err := Installa(p.richiesta("darwin", Utente, "v1", fai("v1", "Prova-AppleSilicon"))); err != nil {
+		t.Fatal(err)
+	}
+	vecchia := filepath.Join(p.c.Utente, "Prova-AppleSilicon.app")
+	if !esiste(vecchia) {
+		t.Fatal("la prima installazione doveva creare Prova-AppleSilicon.app")
+	}
+	estranea := filepath.Join(p.c.Utente, "Altra-Cosa.app") // non installata da CentralHub
+	os.MkdirAll(estranea, 0o755)
+	e, err := Installa(p.richiesta("darwin", Utente, "v2", fai("v2", "Prova")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nuova := filepath.Join(p.c.Utente, "Prova.app")
+	if e.Percorso != nuova || leggi(t, filepath.Join(nuova, "Contents", "MacOS", "Prova")) != "v2" {
+		t.Fatalf("installata: %+v", e)
+	}
+	if esiste(vecchia) {
+		t.Error("l'app con il vecchio nome doveva essere tolta")
+	}
+	if !esiste(estranea) {
+		t.Error("un'app che CentralHub non ha installato non si tocca")
+	}
+	if s := LeggiStato(p.reg, "Prova", "darwin", p.c); !s.Nostro || s.Tag != "v2" || s.Percorso != nuova {
+		t.Errorf("stato: %+v", s)
+	}
+}
+
+// Cambiando il nome del file pubblicato (e della cartella dentro lo zip) tra una versione e l'altra, su Linux e su Windows non nasce nessun doppione:
+// il nome del programma installato viene sempre da quello del programma, non da quello del file.
+func TestLinuxWindowsCambioNomeDeiFile(t *testing.T) {
+	p := nuovaProva(t)
+	// Linux: «Prova-Linux-x86_64.AppImage» → «Prova.AppImage»
+	uno, due := filepath.Join(p.base, "l1", "Prova-Linux-x86_64.AppImage"), filepath.Join(p.base, "l2", "Prova.AppImage")
+	scrivi(t, uno, "uno")
+	scrivi(t, due, "due")
+	if _, err := Installa(p.richiesta("linux", Utente, "v1", uno)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Installa(p.richiesta("linux", Utente, "v2", due)); err != nil {
+		t.Fatal(err)
+	}
+	voci, _ := os.ReadDir(p.c.Utente)
+	if len(voci) != 1 || voci[0].Name() != "Prova.AppImage" || leggi(t, filepath.Join(p.c.Utente, "Prova.AppImage")) != "due" {
+		t.Errorf("Linux: doveva restare solo Prova.AppImage aggiornata: %v", voci)
+	}
+	if s := LeggiStato(p.reg, "Prova", "linux", p.c); !s.Nostro || s.Tag != "v2" || s.Asset != "Prova.AppImage" {
+		t.Errorf("stato Linux: %+v", s)
+	}
+	// Windows: cartella dentro lo zip e nome dello zip diversi tra le due versioni, exe sempre «Prova.exe»
+	q := nuovaProva(t)
+	w1, w2 := filepath.Join(q.base, "w1", "Prova-Windows.zip"), filepath.Join(q.base, "w2", "Prova-win64.zip")
+	os.MkdirAll(filepath.Dir(w1), 0o755)
+	os.MkdirAll(filepath.Dir(w2), 0o755)
+	creaZip(t, w1, map[string]string{"Prova-Windows/Prova.exe": "exe uno", "Prova-Windows/LICENZE/LICENSE": "x"})
+	creaZip(t, w2, map[string]string{"Prova/Prova.exe": "exe due", "Prova/LICENZE/LICENSE": "x"})
+	if _, err := Installa(q.richiesta("windows", Utente, "v1", w1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Installa(q.richiesta("windows", Utente, "v2", w2)); err != nil {
+		t.Fatal(err)
+	}
+	voci, _ = os.ReadDir(q.c.Utente)
+	if len(voci) != 1 || voci[0].Name() != "Prova" || leggi(t, filepath.Join(q.c.Utente, "Prova", "Prova.exe")) != "exe due" {
+		t.Errorf("Windows: doveva restare solo la cartella Prova aggiornata: %v", voci)
+	}
+	if exe, err := EseguibileWindows(filepath.Join(q.c.Utente, "Prova"), "Prova"); err != nil || filepath.Base(exe) != "Prova.exe" {
+		t.Errorf("exe da lanciare: %q %v", exe, err)
+	}
+}

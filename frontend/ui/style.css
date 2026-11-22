@@ -67,7 +67,9 @@ html[data-os="darwin"] .titlebar { padding-left: 84px; }
   background: rgba(79, 209, 255, 0.12);
   border: 1px solid rgba(79, 209, 255, 0.25);
   padding: 1px 7px; border-radius: 20px;
+  font-family: inherit; cursor: pointer; --wails-draggable: no-drag;
 }
+.brand-version:hover { background: rgba(79, 209, 255, 0.2); }
 
 .titlebar-actions { display: flex; gap: 8px; }
 
@@ -464,3 +466,17 @@ select:disabled { opacity: 0.75; }
 .card { flex-wrap: wrap; }
 .card-body { flex: 1 1 280px; min-width: 240px; }
 .card-actions { margin-left: auto; }
+
+/* ---- finestra delle licenze: gruppi chiusi di serie, una riga per componente ---- */
+.licenze-modal { width: 640px; }
+.lic-elenco { max-height: 55vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 12px; }
+.lic-gruppo + .lic-gruppo { border-top: 1px solid var(--border); }
+.lic-testa { display: flex; align-items: center; gap: 10px; width: 100%; background: none; border: 0; padding: 10px 12px; color: var(--text); font: inherit; font-weight: 600; text-align: left; cursor: pointer; }
+.lic-testa:hover { background: rgba(255, 255, 255, 0.04); }
+.lic-testa .freccia { width: 12px; font-size: 10px; color: var(--text-dim); }
+.lic-testa .conta { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--text-dim); }
+.lic-riga { display: flex; align-items: center; gap: 10px; padding: 5px 12px 5px 34px; font-size: 12.5px; }
+.lic-riga .nome { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lic-riga .tipo { color: var(--text-dim); font-size: 11.5px; white-space: nowrap; }
+.lic-riga .btn { padding: 2px 10px; font-size: 12px; }
+#lic-lettura h3 { margin: 12px 0 8px; font-size: 14px; overflow-wrap: anywhere; }

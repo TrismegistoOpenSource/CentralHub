@@ -654,6 +654,61 @@ async function mostraNovita(v) {
 }
 $("nov-chiudi").addEventListener("click", () => { $("dlg-novita").hidden = true; });
 
+// ---- licenze ---------------------------------------------------------------------
+// Si aprono con il clic sul numero di versione (e, su macOS, dal menu «Informazioni su CentralHub e licenze…»). I testi sono incorporati
+// nel programma: funzionano senza rete. I gruppi sono chiusi di serie; ogni componente ha la sua riga e il suo testo.
+const licenze = { aperti: new Set(), catalogo: null };
+
+function disegnaLicenze() {
+  const c = licenze.catalogo, box = $("lic-elenco");
+  box.textContent = "";
+  c.gruppi.forEach((g, i) => {
+    const gr = document.createElement("div"); gr.className = "lic-gruppo";
+    const aperto = licenze.aperti.has(i);
+    const t = document.createElement("button"); t.type = "button"; t.className = "lic-testa";
+    const fr = document.createElement("span"); fr.className = "freccia"; fr.textContent = aperto ? "▼" : "▶";
+    const ti = document.createElement("span"); ti.textContent = g.titolo;
+    const n = document.createElement("span"); n.className = "conta"; n.textContent = g.voci.length;
+    t.append(fr, ti, n);
+    t.addEventListener("click", () => { if (licenze.aperti.has(i)) licenze.aperti.delete(i); else licenze.aperti.add(i); disegnaLicenze(); });
+    gr.append(t);
+    if (aperto) g.voci.forEach((v) => {
+      const r = document.createElement("div"); r.className = "lic-riga"; r.title = v.come || "";
+      const nome = document.createElement("span"); nome.className = "nome"; nome.textContent = v.nome;
+      const tipo = document.createElement("span"); tipo.className = "tipo"; tipo.textContent = v.licenza;
+      const b = document.createElement("button"); b.type = "button"; b.className = "btn ghost"; b.textContent = "Leggi";
+      b.addEventListener("click", () => leggiLicenza(v));
+      r.append(nome, tipo, b); gr.append(r);
+    });
+    box.append(gr);
+  });
+}
+
+async function leggiLicenza(v) {
+  try {
+    const testo = await api().TestoLicenza(v.k);
+    $("lic-voce").textContent = v.nome + " · " + v.licenza;
+    $("lic-testo").textContent = testo;
+    $("lic-elenco").hidden = true; $("lic-nota").hidden = true; $("lic-lettura").hidden = false;
+  } catch (e) { barra(messaggio(e), true); }
+}
+
+async function apriLicenze() {
+  try {
+    licenze.catalogo = await api().Licenze();
+    $("lic-titolo").textContent = "CentralHub " + licenze.catalogo.versione + " · Licenze";
+    $("lic-nota").textContent = licenze.catalogo.raccolta
+      ? "Qui sono i testi di licenza di tutto ciò che sta dentro CentralHub. Aprendo un gruppo vedi i componenti; «Leggi» mostra il testo intero. Non serve la rete."
+      : "Questa copia è stata compilata a mano senza la raccolta delle licenze: ne mostra solo una parte.";
+    $("lic-nota").hidden = false; $("lic-elenco").hidden = false; $("lic-lettura").hidden = true;
+    disegnaLicenze();
+    $("dlg-licenze").hidden = false;
+  } catch (e) { barra(messaggio(e), true); }
+}
+$("versione").addEventListener("click", apriLicenze);
+$("lic-indietro").addEventListener("click", () => { $("lic-lettura").hidden = true; $("lic-elenco").hidden = false; $("lic-nota").hidden = false; });
+$("lic-chiudi").addEventListener("click", () => { $("dlg-licenze").hidden = true; });
+
 // ---- finestra del repository -------------------------------------------------
 
 function mostraAmbito() {
@@ -781,6 +836,7 @@ document.addEventListener("keydown", (e) => {
   else if (!$("dlg-esporta").hidden) $("esp-annulla").click();
   else if (!$("dlg-installa").hidden) $("inst-annulla").click();
   else if (!$("dlg-ambito").hidden) $("ambito-annulla").click();
+  else if (!$("dlg-licenze").hidden) { if (!$("lic-lettura").hidden) $("lic-indietro").click(); else $("lic-chiudi").click(); }
   else if (!$("dlg-repo").hidden) $("dlg-repo").hidden = true;
 });
 
@@ -809,6 +865,7 @@ async function mostraAutoverifica() {
 async function avvia() {
   window.runtime.EventsOn("repo", (v) => { metti(v); ridisegna(v.id); });
   window.runtime.EventsOn("log", riga);
+  window.runtime.EventsOn("apri-licenze", apriLicenze);
   await ricarica();
   // All'apertura: c'è qualcosa da aggiornare? Solo se l'ultimo controllo è
   // di più di un'ora fa (quelli pubblici sempre: il sito non conta); «Controlla» lo fa sempre.

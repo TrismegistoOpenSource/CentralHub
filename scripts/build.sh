@@ -5,10 +5,11 @@
 # solo modo di compilare, così un attestato locale verde vale anche per GitHub.
 #
 #   macOS    ../build/CentralHub-AppleSilicon.app e CentralHub-Intel.app
-#            (due app ad architettura pura, bundle id e nome distinti, LICENZE
-#            dentro, rifirmate)
-#   Linux    ../build/CentralHub-Linux-amd64/CentralHub + LICENZE
-#   Windows  ../build/CentralHub-Windows/CentralHub.exe + LICENZE
+#            (due app ad architettura pura, bundle id e nome distinti, rifirmate)
+#   Linux    ../build/CentralHub-Linux-amd64/CentralHub
+#   Windows  ../build/CentralHub-Windows/CentralHub.exe
+#
+# Le licenze stanno DENTRO il programma (internal/licenze, clic sul numero di versione): nessuna cartella di licenze accanto.
 #
 # Il pacchetto da pubblicare (zip, AppImage) lo fa scripts/pacchetto.sh.
 #
@@ -33,14 +34,19 @@ fi
 OUT_DIR="../build"
 mkdir -p "${OUT_DIR}"
 
-cleanup() { rm -rf build; }
+# Le licenze nell'app (clic sul numero di versione) sono sempre quelle di ciò che finisce nel programma: si raccolgono a ogni build in
+# internal/licenze/testi/raccolta (incorporate con go:embed) e si tolgono dopo, MA solo se le ha create questo script (ci-locale.sh le
+# prepara una volta per tutto il giro). La build si ferma se una libreria non ha il suo testo (cancello di raccogli-licenze.sh).
+LIC_GIA=0; [ -d internal/licenze/testi/raccolta ] && LIC_GIA=1
+cleanup() {
+  rm -rf build
+  [ "$LIC_GIA" = 1 ] || rm -rf internal/licenze/testi/raccolta
+}
 trap cleanup EXIT
+[ "$LIC_GIA" = 1 ] || bash scripts/raccogli-licenze.sh internal/licenze/testi/raccolta
 rm -rf build
 mkdir -p build
 cp -R assets/. build/
-
-# I testi delle licenze viaggiano CON l'app (PROBLEMI-NOTI.md §23).
-copy_licenses() { bash scripts/raccogli-licenze.sh "$1/LICENZE"; }
 
 # build_mac <platform> <nome .app> <bundle id> <min macOS>
 build_mac() {
@@ -50,7 +56,6 @@ build_mac() {
   wails build -platform "${platform}"
   rm -rf "${dest}"
   cp -R build/bin/CentralHub.app "${dest}"
-  copy_licenses "${dest}/Contents/Resources"
   local plist="${dest}/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${bundleid}" "${plist}"
   /usr/libexec/PlistBuddy -c "Set :CFBundleName ${appname}" "${plist}"
@@ -78,19 +83,17 @@ build_linux() {
   wails build -platform linux/amd64 -tags webkit2_41
   rm -rf "${dest}"; mkdir -p "${dest}"
   cp build/bin/CentralHub "${dest}/CentralHub"
-  copy_licenses "${dest}"
   echo "  → ${dest}/CentralHub"
 }
 
 # Windows: exe portable senza cgo (go-webview2 non ne ha bisogno, niente gcc
-# sul runner). Accanto, la cartella LICENZE.
+# sul runner).
 build_windows() {
   local dest="${OUT_DIR}/CentralHub-Windows"
   echo; echo "▸ Windows (windows/amd64)"
   CGO_ENABLED=0 wails build -platform windows/amd64
   rm -rf "${dest}"; mkdir -p "${dest}"
   cp build/bin/CentralHub.exe "${dest}/CentralHub.exe"
-  copy_licenses "${dest}"
   echo "  → ${dest}/CentralHub.exe"
 }
 

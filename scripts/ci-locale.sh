@@ -43,6 +43,26 @@ esac
 if [ "${1:-}" != "--nella-copia" ]; then
   WS="$(pwd -P)"
   IMPRONTA="$(bash scripts/impronta.sh)"
+  # Niente eseguibili, librerie o binari di test nel sorgente: finirebbero nel
+  # commit (31/10/2026: un ifc.test.exe di "go test -c" era entrato nell'impronta).
+  compilato() {
+    case "$1" in *.exe|*.test|*.dll|*.so|*.dylib|*.o|*.a|*.pyc) return 0 ;; esac
+    case "$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')" in
+      7f454c46|cffaedfe|cefaedfe|feedfacf|feedface|cafebabe|4d5a*) return 0 ;;
+    esac
+    return 1
+  }
+  binari="$(bash scripts/impronta.sh --elenco | while IFS= read -r f; do
+    if compilato "$f"; then echo "$f"; fi
+  done)"
+  if [ -n "$binari" ]; then
+    echo "!!! FALLITO: nel sorgente ci sono file compilati, da togliere:"; echo "$binari"; exit 1
+  fi
+  # le licenze raccolte per l'app sono generate (build.sh e ci-locale.sh le creano e le tolgono): nel sorgente non devono restare
+  generati="$(bash scripts/impronta.sh --elenco | grep -E '^internal/licenze/testi/raccolta/' || true)"
+  if [ -n "$generati" ]; then
+    echo "!!! FALLITO: nel sorgente sono rimaste le licenze raccolte (si tolgono con: rm -rf internal/licenze/testi/raccolta):"; echo "$generati"; exit 1
+  fi
   case "$SISTEMA" in
     linux) BASE="${XDG_CACHE_HOME:-$HOME/.cache}/ci-locale" ;;   # /tmp della VM Linux è in RAM
     # %TEMP% arriva come C:\...: il tar di Git Bash legge "C:" come un host
@@ -85,7 +105,7 @@ fallito() { echo "!!! FALLITO: $*"; esito=1; }
 # Le cartelle che le build creano nel sorgente si tolgono sempre: la copia
 # resta pulita per un'eventuale seconda prova.
 # shellcheck disable=SC2317,SC2329  # chiamata dalla trap (codice per shellcheck 0.10 e 0.11)
-pulizia() { rm -rf build frontend/dist frontend/wailsjs frontend/node_modules frontend/package.json.md5; }
+pulizia() { rm -rf build frontend/dist frontend/wailsjs frontend/node_modules frontend/package.json.md5 internal/licenze/testi/raccolta; }
 trap pulizia EXIT
 
 tag_var="GO_TAGS_$SISTEMA"; TAGS="${!tag_var:-}"
@@ -133,6 +153,13 @@ if [ "$SISTEMA" = linux ] && [ -n "${APT_linux:-}" ]; then
 fi
 if [ "$SISTEMA" = windows ]; then
   if v="$(gcc --version 2>/dev/null)"; then echo "${v%%$'\n'*}"; else fallito "gcc non trovato: -race non disponibile"; fi
+fi
+
+if [ -f scripts/raccogli-licenze.sh ] && [ -d internal/licenze ]; then
+  # le licenze incorporate nell'app: i test controllano che ci siano tutte (CENTRALHUB_LICENZE_OBBLIGATORIE)
+  passo "Licenze incorporate"
+  bash scripts/raccogli-licenze.sh internal/licenze/testi/raccolta || { fallito "raccolta delle licenze fallita"; exit 1; }
+  export CENTRALHUB_LICENZE_OBBLIGATORIE=1
 fi
 
 passo "Build (scripts/build.sh)"

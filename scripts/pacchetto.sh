@@ -8,7 +8,7 @@
 #
 #   macOS    ../build/CentralHub-AppleSilicon.zip, CentralHub-Intel.zip
 #   Linux    ../build/CentralHub-Linux-x86_64.AppImage
-#   Windows  ../build/CentralHub-Windows.zip (cartella con exe e LICENZE)
+#   Windows  ../build/CentralHub-Windows.zip (cartella con l'exe)
 #
 # Per l'autoverifica (internal/autoverifica) ogni sistema consegna anche
 # ../build/INTEGRITA-<sistema>.txt: lo SHA-256 di ogni file che l'utente riceve,
@@ -33,24 +33,40 @@ pacchetto_macos() {
   done
 }
 
-pacchetto_linux() {
-  # appimagetool: quello indicato da APPIMAGETOOL, altrimenti si tiene in
-  # ~/.local/bin, scaricato la prima volta (sui runner ogni volta).
-  local tool="${APPIMAGETOOL:-$HOME/.local/bin/appimagetool-x86_64.AppImage}"
-  local url="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-  if [ ! -x "$tool" ]; then
-    mkdir -p "$(dirname "$tool")"
-    curl -fsSL -o "$tool.part" "$url"
-    chmod +x "$tool.part"
-    mv "$tool.part" "$tool"
+# scarica_fisso <file> <url> <sha256>: scarica una volta e controlla lo SHA-256
+# (quello pubblicato nella release su GitHub); un file diverso non si usa mai.
+scarica_fisso() {
+  local f="$1" url="$2" sha="$3"
+  [ -f "$f" ] && [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$sha" ] && return 0
+  mkdir -p "$(dirname "$f")"
+  curl -fsSL -o "$f.part" "$url"
+  if [ "$(sha256sum "$f.part" | cut -d' ' -f1)" != "$sha" ]; then
+    rm -f "$f.part"
+    echo "!!! $(basename "$f") scaricato con SHA-256 diverso da $sha" >&2
+    return 1
   fi
+  chmod +x "$f.part"
+  mv "$f.part" "$f"
+}
+
+pacchetto_linux() {
+  # appimagetool e runtime dell'AppImage a versione fissa. Si aggiornano quando
+  # loro sono avanti di due versioni minor (STRUMENTI-CLAUDE/controlla-appimage.sh):
+  # versione, SHA-256 e licenses/appimage-runtime.txt. Si tengono in
+  # ~/.local/bin, scaricati la prima volta (sui runner ogni volta).
+  local tool="$HOME/.local/bin/appimagetool-1.9.1-x86_64.AppImage"
+  local runtime="$HOME/.local/bin/appimage-runtime-20251108-x86_64"
+  scarica_fisso "$tool" \
+    https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+    ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+  scarica_fisso "$runtime" \
+    https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64 \
+    2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
   local lavoro A
   lavoro="$(mktemp -d "${TMPDIR:-/tmp}/ch-appimage-XXXXXX")"
   A="$lavoro/CentralHub.AppDir"
   mkdir -p "$A/usr/bin" "$A/usr/share/icons/hicolor/256x256/apps"
   cp "$B/CentralHub-Linux-amd64/CentralHub" "$A/usr/bin/"
-  mkdir -p "$A/usr/share/doc"
-  cp -R "$B/CentralHub-Linux-amd64/LICENZE" "$A/usr/share/doc/centralhub"
   cp assets/appicon.png "$A/centralhub.png"
   cp assets/appicon.png "$A/usr/share/icons/hicolor/256x256/apps/centralhub.png"
   cat > "$A/CentralHub.desktop" <<'DESKTOP'
@@ -68,7 +84,7 @@ DESKTOP
   cp "$A/INTEGRITA.txt" "$B/INTEGRITA-linux-amd64.txt"
   # --appimage-extract-and-run: i runner non hanno FUSE.
   rm -f "$B/CentralHub-Linux-x86_64.AppImage"
-  ARCH=x86_64 "$tool" --appimage-extract-and-run "$A" "$B/CentralHub-Linux-x86_64.AppImage"
+  ARCH=x86_64 "$tool" --appimage-extract-and-run --runtime-file "$runtime" "$A" "$B/CentralHub-Linux-x86_64.AppImage"
   rm -rf "$lavoro"
   echo "→ $B/CentralHub-Linux-x86_64.AppImage"
 }
